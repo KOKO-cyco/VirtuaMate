@@ -15,7 +15,7 @@
 
 #include "tal_api.h"
 #include "ai_mcp_server.h"
-#include "gl_renderer.h"
+#include "vrm_renderer.h"
 #include "cJSON.h"
 
 #include <string.h>

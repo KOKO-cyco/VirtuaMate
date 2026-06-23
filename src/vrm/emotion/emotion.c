@@ -8,7 +8,7 @@
  * exponential lerp, and layers a procedural blink on top.
  */
 
-#include "emotion.h"
+#include "vrm_emotion.h"
 
 #include <stdio.h>
 #include <string.h>

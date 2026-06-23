@@ -13,6 +13,32 @@
 #define VRM_MAX_BONES            512
 #define VRM_MAX_MORPH_TARGETS    128
 #define VRM_MAX_EXPRESSIONS      64
+#define VRM_MAX_MATERIALS        64
+
+/** MToon blend mode (UniVRM). */
+typedef enum {
+    VRM_MTOON_OPAQUE = 0,
+    VRM_MTOON_CUTOUT = 1,
+    VRM_MTOON_TRANSPARENT = 2,
+    VRM_MTOON_TRANSPARENT_ZWRITE = 3,
+} vrm_mtoon_blend_mode_t;
+
+/** Parsed VRM / glTF material (MToon-focused). */
+typedef struct {
+    char                    name[64];
+    char                    shader[32];
+    int                     is_mtoon;
+    int                     is_unlit;
+    vrm_mtoon_blend_mode_t  blend_mode;
+    int                     render_queue;
+    float                   color[4];
+    float                   shade_color[4];
+    float                   cutoff;
+    float                   shade_shift;
+    float                   shade_toony;
+    int                     tex_main;
+    int                     tex_shade;
+} vrm_material_t;
 
 /** Decoded texture (RGBA pixels). */
 typedef struct {
@@ -39,6 +65,7 @@ typedef struct {
     uint32_t  index_count;
     float     color[4];      /**< Material base color (RGBA) */
     int       texture_index; /**< Index into vrm_model_t::textures, or -1 */
+    int       material_index;/**< glTF material index, or -1 */
     int       has_bones;     /**< 1 if this mesh has skinning data */
 
     /* Morph targets */
@@ -187,6 +214,8 @@ typedef struct {
     uint32_t          mesh_count;
     vrm_texture_t    *textures;
     uint32_t          texture_count;
+    vrm_material_t   *materials;
+    uint32_t          material_count;
     float             bbox_min[3];
     float             bbox_max[3];
     float             center[3];   /**< AABB center */
@@ -279,5 +308,38 @@ void vrm_apply_morph_targets(vrm_model_t *model);
  * @param interval Seconds between blinks (e.g. 4.0).
  */
 void vrm_auto_blink(vrm_model_t *model, float time_sec, float interval);
+
+/**
+ * @brief Extract VRM 0.x MToon materialProperties (call after meshes/textures load).
+ * @param[in,out] model  Model to populate.
+ * @param[in]     path   Path to .vrm file.
+ * @return 0 on success, -1 if no VRM materials found.
+ */
+int vrm_loader_extract_mtoon_materials(vrm_model_t *model, const char *path);
+
+/**
+ * @brief Get MToon renderQueue for a mesh.
+ * @param[in] model       Loaded model.
+ * @param[in] mesh_index  Mesh index.
+ * @return renderQueue value (default 2000).
+ */
+int vrm_material_render_queue(const vrm_model_t *model, uint32_t mesh_index);
+
+/**
+ * @brief Return 1 if mesh uses VRM/MToon material.
+ * @param[in] model       Loaded model.
+ * @param[in] mesh_index  Mesh index.
+ * @return 1 if MToon, else 0.
+ */
+int vrm_material_is_mtoon(const vrm_model_t *model, uint32_t mesh_index);
+
+/**
+ * @brief Get material for a mesh.
+ * @param[in] model       Loaded model.
+ * @param[in] mesh_index  Mesh index.
+ * @return Material pointer or NULL.
+ */
+const vrm_material_t *vrm_mesh_material(const vrm_model_t *model,
+                                          uint32_t mesh_index);
 
 #endif /* VRM_LOADER_H */

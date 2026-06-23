@@ -21,10 +21,21 @@ aux_source_directory(${APP_PATH}/agent APP_SRCS)
 
 # VRM 3D renderer sources
 aux_source_directory(${APP_PATH}/src/vrm APP_VRM_SRCS)
+aux_source_directory(${APP_PATH}/src/vrm/loader APP_VRM_LOADER_SRCS)
+aux_source_directory(${APP_PATH}/src/vrm/renderer APP_VRM_RENDERER_SRCS)
+aux_source_directory(${APP_PATH}/src/vrm/overlay APP_VRM_OVERLAY_SRCS)
 aux_source_directory(${APP_PATH}/src/vrm/emotion APP_VRM_EMOTION_SRCS)
 aux_source_directory(${APP_PATH}/src/vrm/spring_bone APP_VRM_SPRING_SRCS)
 aux_source_directory(${APP_PATH}/src/vrm/scene APP_VRM_SCENE_SRCS)
-list(APPEND APP_SRCS ${APP_VRM_SRCS} ${APP_VRM_EMOTION_SRCS} ${APP_VRM_SPRING_SRCS} ${APP_VRM_SCENE_SRCS})
+list(APPEND APP_SRCS
+    ${APP_VRM_SRCS}
+    ${APP_VRM_LOADER_SRCS}
+    ${APP_VRM_RENDERER_SRCS}
+    ${APP_VRM_OVERLAY_SRCS}
+    ${APP_VRM_EMOTION_SRCS}
+    ${APP_VRM_SPRING_SRCS}
+    ${APP_VRM_SCENE_SRCS}
+)
 
 # APP_INC
 set(APP_INC
@@ -39,7 +50,7 @@ set(APP_INC
     ${APP_PATH}/agent
     ${APP_PATH}/ai_components/assets/include
     ${APP_PATH}/src/vrm
-    ${APP_PATH}/src/vrm/scene
+    ${APP_PATH}/TuyaOpen/src/liblvgl/v9/lvgl/src/libs/tiny_ttf
 )
 
 ########################################

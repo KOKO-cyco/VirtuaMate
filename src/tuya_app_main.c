@@ -57,7 +57,7 @@
 #include "agent_loop.h"
 
 #include "tuya_kconfig.h"
-#include "gl_renderer.h"
+#include "vrm_renderer.h"
 #include "app_avatar_mcp.h"
 
 #if defined(ENABLE_QRCODE) && (ENABLE_QRCODE == 1)

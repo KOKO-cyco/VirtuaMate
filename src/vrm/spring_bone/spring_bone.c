@@ -12,7 +12,7 @@
  *   7. Compute rotation: initialLocalRot * FromToRotation(boneAxis, localBoneVector)
  */
 
-#include "spring_bone.h"
+#include "vrm_spring_bone.h"
 
 #include <stdio.h>
 #include <string.h>
