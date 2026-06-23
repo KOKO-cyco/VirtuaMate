@@ -39,7 +39,7 @@ set(APP_INC
     ${APP_PATH}/agent
     ${APP_PATH}/ai_components/assets/include
     ${APP_PATH}/src/vrm
-    ${APP_PATH}/src/vrm/scene    
+    ${APP_PATH}/src/vrm/scene
 )
 
 ########################################

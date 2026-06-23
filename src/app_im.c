@@ -8,13 +8,16 @@
 #include "app_im.h"
 
 #include "tal_api.h"
+#include "app_base_config.h"
 
 #include "im_api.h"
+#include "sys_bus.h"
 #include "ai_agent.h"
 #include "ai_chat_main.h"
 #include "tal_system.h"
 #include "tuya_app_config.h"
 #include "channels/feishu_bot.h"
+#include "channels/qqbot_channel.h"
 #include "ws_server.h"
 #include <stdatomic.h>
 
@@ -22,6 +25,10 @@
 ************************macro define************************
 ***********************************************************/
 #define INBOUND_POLL_MS  100
+
+#ifndef IM_BRIDGE_STACK_SIZE
+#define IM_BRIDGE_STACK_SIZE (4 * 1024)
+#endif
 
 /***********************************************************
 ***********************typedef define***********************
@@ -36,8 +43,7 @@
 /***********************************************************
 ***********************variable define**********************
 ***********************************************************/
-static THREAD_HANDLE s_outbound_thd = NULL;
-// static THREAD_HANDLE s_inbound_thd  = NULL;
+static THREAD_HANDLE s_bridge_thd = NULL;
 
 static char *s_channel = NULL;
 static char s_chat_id[96] = {0};
@@ -53,20 +59,19 @@ static const char *__app_im_map_channel(const char *channel)
     }
     if (strcmp(channel, IM_CHAN_TELEGRAM) == 0) {
         return IM_CHAN_TELEGRAM;
-    }
-    if (strcmp(channel, IM_CHAN_DISCORD) == 0) {
+    } else if (strcmp(channel, IM_CHAN_DISCORD) == 0) {
         return IM_CHAN_DISCORD;
-    }
-    if (strcmp(channel, IM_CHAN_FEISHU) == 0) {
+    } else if (strcmp(channel, IM_CHAN_FEISHU) == 0) {
         return IM_CHAN_FEISHU;
-    }
-    if (strcmp(channel, IM_CHAN_WS) == 0) {
+    } else if (strcmp(channel, IM_CHAN_WEIXIN) == 0) {
+        return IM_CHAN_WEIXIN;
+    } else if (strcmp(channel, IM_CHAN_QQBOT) == 0) {
+        return IM_CHAN_QQBOT;
+    } else if (strcmp(channel, IM_CHAN_WS) == 0) {
         return IM_CHAN_WS;
-    }
-    if (strcmp(channel, "system") == 0 || strcmp(channel, "cron") == 0) {
+    } else {
         return s_channel;
     }
-    return NULL;
 }
 
 static BOOL_T __app_im_ws_token_valid(void)
@@ -108,54 +113,100 @@ const char *app_im_get_chat_id(void)
     return (s_chat_id[0] != '\0') ? s_chat_id : NULL;
 }
 
-static void outbound_dispatch_task(void *arg)
+/* ---- sys_bus sender callbacks (one per IM channel) ---- */
+
+static OPERATE_RET __send_telegram(const char *chat_id, const char *text)
+{
+    return telegram_send_message(chat_id, text ? text : "");
+}
+
+static OPERATE_RET __send_discord(const char *chat_id, const char *text)
+{
+    return discord_send_message(chat_id, text ? text : "");
+}
+
+static OPERATE_RET __send_feishu(const char *chat_id, const char *text)
+{
+    return feishu_send_message(chat_id, text ? text : "");
+}
+
+static OPERATE_RET __send_weixin(const char *chat_id, const char *text)
+{
+    return weixin_send_message(chat_id, text ? text : "");
+}
+
+static OPERATE_RET __send_qqbot(const char *chat_id, const char *text)
+{
+    return qqbot_send_message(chat_id, text ? text : "");
+}
+
+static OPERATE_RET __send_ws(const char *chat_id, const char *text)
+{
+    if (!__app_im_ws_token_valid()) {
+        PR_WARN("ws outbound dropped: CLAW_WS_AUTH_TOKEN is empty");
+        return OPRT_COM_ERROR;
+    }
+    if (!chat_id || chat_id[0] == '\0') {
+        PR_WARN("ws outbound dropped: empty chat_id");
+        return OPRT_INVALID_PARM;
+    }
+    return ws_server_send(chat_id, text ? text : "");
+}
+
+/* ---- IM inbound → sys_bus bridge thread ---- */
+
+static void __im_bridge_task(void *arg)
 {
     (void)arg;
-    PR_INFO("outbound dispatcher started");
-    while (1) {
-        im_msg_t msg = {0};
-        if (message_bus_pop_outbound(&msg, 0xffffffff) != OPRT_OK) continue;
-        if (!msg.content) continue;
+    PR_INFO("app_im: IM→sys_bus bridge started");
 
-        if (strcmp(msg.channel, IM_CHAN_TELEGRAM) == 0) {
-            (void)telegram_send_message(msg.chat_id, msg.content ? msg.content : "");
-        } else if (strcmp(msg.channel, IM_CHAN_DISCORD) == 0) {
-            (void)discord_send_message(msg.chat_id, msg.content ? msg.content : "");
-        } else if (strcmp(msg.channel, IM_CHAN_FEISHU) == 0) {
-            (void)feishu_send_message(msg.chat_id,
-                                      msg.content ? msg.content : "",
-                                      msg.mentions_json);
-        } else if (strcmp(msg.channel, IM_CHAN_WS) == 0) {
-            if (!__app_im_ws_token_valid()) {
-                PR_WARN("ws outbound dropped: CLAW_WS_AUTH_TOKEN is empty");
-            } else if (msg.chat_id[0] == '\0') {
-                PR_WARN("ws outbound dropped: empty chat_id");
-            } else {
-                OPERATE_RET ws_rt = ws_server_send(msg.chat_id, msg.content ? msg.content : "");
-                if (ws_rt != OPRT_OK) {
-                    PR_WARN("ws_server_send failed chat_id=%s rt=%d", msg.chat_id, ws_rt);
-                }
-            }
-        } else if (strcmp(msg.channel, "system") == 0) {
-            PR_INFO("system msg: %s", msg.content ? msg.content : "");
+    while (1) {
+        im_msg_t im = {0};
+        if (message_bus_pop_inbound(&im, 0xffffffff) != OPRT_OK) continue;
+        if (!im.content) continue;
+
+        /* Transfer ownership: im_msg_t → sys_msg_t (content pointers move) */
+        sys_msg_t io = {0};
+        strncpy(io.channel, im.channel, sizeof(io.channel) - 1);
+        strncpy(io.chat_id, im.chat_id, sizeof(io.chat_id) - 1);
+        io.content       = im.content;        /* pointer ownership transfer */
+
+        if (sys_bus_push_inbound(&io) != OPRT_OK) {
+            PR_ERR("app_im: sys_bus_push_inbound failed");
+            im_free(io.content);
         }
-        im_free(msg.content);
-        im_free(msg.mentions_json);
     }
 }
 
-static OPERATE_RET start_outbound_dispatcher(void)
+static OPERATE_RET start_im_bridge(void)
 {
-    if (s_outbound_thd) return OPRT_OK;
+    if (s_bridge_thd) return OPRT_OK;
     THREAD_CFG_T cfg = {0};
-    cfg.stackDepth = IM_OUTBOUND_STACK;
+    cfg.stackDepth = IM_BRIDGE_STACK_SIZE;
     cfg.priority   = THREAD_PRIO_1;
-    cfg.thrdname   = "outbound_loop";
+    cfg.thrdname   = "im_bridge";
 #if defined(ENABLE_EXT_RAM) && (ENABLE_EXT_RAM == 1)
     cfg.psram_mode = 1;
 #endif
-    OPERATE_RET rt = tal_thread_create_and_start(&s_outbound_thd, NULL, NULL, outbound_dispatch_task, NULL, &cfg);
+    OPERATE_RET rt = tal_thread_create_and_start(&s_bridge_thd, NULL, NULL,
+                                       __im_bridge_task, NULL, &cfg);
+    if (rt != OPRT_OK) {
+        PR_ERR("app_im: start im bridge thread failed: %d", rt);
+        return rt;
+    }
     return rt;
+}
+
+/* ---- Register all IM senders with sys_bus ---- */
+
+static void __register_im_senders(void)
+{
+    sys_bus_register_sender(SYS_CHAN_TELEGRAM, __send_telegram);
+    sys_bus_register_sender(SYS_CHAN_DISCORD,  __send_discord);
+    sys_bus_register_sender(SYS_CHAN_FEISHU,   __send_feishu);
+    sys_bus_register_sender(SYS_CHAN_WEIXIN,   __send_weixin);
+    sys_bus_register_sender(SYS_CHAN_QQBOT,    __send_qqbot);
+    sys_bus_register_sender(SYS_CHAN_WS,       __send_ws);
 }
 
 static OPERATE_RET app_im_init_evt_cb(void *data)
@@ -210,21 +261,30 @@ static OPERATE_RET app_im_init_evt_cb(void *data)
             rt = feishu_bot_start();
         }
         s_channel = IM_CHAN_FEISHU;
-    } else {
-        PR_WARN("unknown channel_mode '%s', fallback to %s", mode, IM_SECRET_CHANNEL_MODE);
-        rt = telegram_bot_init();
+    } else if (strcmp(mode, IM_CHAN_WEIXIN) == 0) {
+        rt = weixin_bot_init();
         if (rt == OPRT_OK) {
-            rt = telegram_bot_start();
+            rt = weixin_bot_start();
         }
-        s_channel = IM_CHAN_TELEGRAM;
+        s_channel = IM_CHAN_WEIXIN;
+    } else if (strcmp(mode, IM_CHAN_QQBOT) == 0) {
+        rt = qqbot_channel_init();
+        if (rt == OPRT_OK) {
+            rt = qqbot_channel_start();
+        }
+        s_channel = IM_CHAN_QQBOT;
+    } else {
+        PR_WARN("Turned off IM channel '%s'", mode);
+        s_channel = IM_CHAN_OFF;
     }
 
     if (rt != OPRT_OK) {
-        PR_ERR("im bot start failed rt:%d (mode=%s)", rt, mode);
-        /* keep running loops so outbound/system messages still work */
+        PR_ERR("IM channel '%s' initialization failed rt:%d", mode, rt);
+        /* Don't return early — still register senders (WS/ACP) and start bridge */
     }
 
-    start_outbound_dispatcher();
+    __register_im_senders();
+    start_im_bridge();
 
     return OPRT_OK;
 }
@@ -237,8 +297,7 @@ OPERATE_RET app_im_init(void)
 
 static OPERATE_RET app_im_bot_send_message_to(const char *channel,
                                        const char *chat_id,
-                                       const char *message,
-                                       const char *mentions_json)
+                                       const char *message)
 {
     const char *target_channel = __app_im_map_channel(channel);
     const char *target_chat_id = chat_id;
@@ -267,7 +326,7 @@ static OPERATE_RET app_im_bot_send_message_to(const char *channel,
 
     PR_DEBUG("app im bot send message: %s", message);
 
-    im_msg_t out = {0};
+    sys_msg_t out = {0};
     strncpy(out.channel, target_channel, sizeof(out.channel) - 1);
     out.channel[sizeof(out.channel) - 1] = '\0';
     strncpy(out.chat_id, target_chat_id, sizeof(out.chat_id) - 1);
@@ -275,35 +334,21 @@ static OPERATE_RET app_im_bot_send_message_to(const char *channel,
 
     PR_DEBUG("app im bot send message: channel=%s, chat_id=%s", out.channel, out.chat_id);
 
-    out.content = im_malloc(strlen(message) + 1);
+    out.content = claw_malloc(strlen(message) + 1);
     if (!out.content) {
         return OPRT_MALLOC_FAILED;
     }
     memset(out.content, 0, strlen(message) + 1);
     strncpy(out.content, message, strlen(message) + 1);
 
-    if (mentions_json && mentions_json[0] != '\0') {
-        out.mentions_json = im_strdup(mentions_json);
-        if (!out.mentions_json) {
-            im_free(out.content);
-            return OPRT_MALLOC_FAILED;
-        }
-    }
-
-    OPERATE_RET rt = message_bus_push_outbound(&out);
+    OPERATE_RET rt = sys_bus_push_outbound(&out);
     if (rt != OPRT_OK) {
-        im_free(out.content);
-        im_free(out.mentions_json);
+        claw_free(out.content);
     }
     return rt;
 }
 
-OPERATE_RET app_im_bot_send_message_with_mentions(const char *message, const char *mentions_json)
-{
-    return app_im_bot_send_message_to(NULL, NULL, message, mentions_json);
-}
-
 OPERATE_RET app_im_bot_send_message(const char *message)
 {
-    return app_im_bot_send_message_to(NULL, NULL, message, NULL);
+    return app_im_bot_send_message_to(NULL, NULL, message);
 }

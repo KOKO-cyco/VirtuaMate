@@ -31,8 +31,9 @@
 #include "acp_client.h"
 #include "tool_files.h"
 #include "tuya_app_config.h"
+#include "app_base_config.h"
 #include "app_im.h"
-#include "bus/message_bus.h"
+#include "sys_bus.h"
 
 #include "cJSON.h"
 #include "mix_method.h"
@@ -126,6 +127,20 @@ typedef struct {
  * --------------------------------------------------------------------------- */
 
 static acp_ctx_t s_ctx;
+
+/* KV-backed config (loaded once at init, used throughout) */
+static char s_gw_host[64]    = {0};
+static char s_gw_token[128]  = {0};
+static char s_device_id[64]  = {0};
+static unsigned s_gw_port    = 0;
+
+static void acp_load_config(void)
+{
+    app_cfg_get_gw_host(s_gw_host, sizeof(s_gw_host));
+    s_gw_port = app_cfg_get_gw_port_num();
+    app_cfg_get_gw_token(s_gw_token, sizeof(s_gw_token));
+    app_cfg_get_device_id(s_device_id, sizeof(s_device_id));
+}
 
 /* ---------------------------------------------------------------------------
  * Forward declarations
@@ -375,8 +390,12 @@ static OPERATE_RET __ws_upgrade(int fd, const char *host, uint16_t port)
         return rt;
     }
 
-    char req[512] = {0};
-    int  n = snprintf(req, sizeof(req),
+    char *req = (char *)claw_malloc(512);
+    if (!req) {
+        return OPRT_MALLOC_FAILED;
+    }
+    memset(req, 0, 512);
+    int  n = snprintf(req, 512,
         "GET / HTTP/1.1\r\n"
         "Host: %s:%u\r\n"
         "Origin: http://%s:%u\r\n"
@@ -385,30 +404,39 @@ static OPERATE_RET __ws_upgrade(int fd, const char *host, uint16_t port)
         "Sec-WebSocket-Key: %s\r\n"
         "Sec-WebSocket-Version: 13\r\n\r\n",
         host, (unsigned)port, host, (unsigned)port, client_key);
-    if (n <= 0 || (size_t)n >= sizeof(req)) {
+    if (n <= 0 || (size_t)n >= 512) {
+        claw_free(req);
         return OPRT_BUFFER_NOT_ENOUGH;
     }
 
     rt = __send_all(fd, (const uint8_t *)req, (size_t)n);
+    claw_free(req);
     if (rt != OPRT_OK) {
         PR_ERR("acp upgrade send failed rt=%d", rt);
         return rt;
     }
 
     /* Read the server HTTP response (look for "101") */
-    uint8_t resp[512] = {0};
-    int   got = __recv_timeout(fd, resp, sizeof(resp) - 1, ACP_SYNC_RECV_TIMEOUT_MS);
+    uint8_t *resp = (uint8_t *)claw_malloc(512);
+    if (!resp) {
+        return OPRT_MALLOC_FAILED;
+    }
+    memset(resp, 0, 512);
+    int   got = __recv_timeout(fd, resp, 512 - 1, ACP_SYNC_RECV_TIMEOUT_MS);
     if (got <= 0) {
         PR_ERR("acp upgrade recv timeout/err got=%d", got);
+        claw_free(resp);
         return OPRT_RECV_ERR;
     }
     resp[got] = '\0';
 
     if (!strstr((const char *)resp, "101")) {
         PR_ERR("acp upgrade rejected: %.80s", (const char *)resp);
+        claw_free(resp);
         return OPRT_COM_ERROR;
     }
 
+    claw_free(resp);
     PR_INFO("acp ws upgrade ok host=%s:%u", host, (unsigned)port);
     return OPRT_OK;
 }
@@ -494,10 +522,10 @@ static OPERATE_RET __acp_connect(int fd, char *session_key, size_t sk_size)
     cJSON_AddStringToObject(client, "version",      "1.0.0");
     cJSON_AddStringToObject(client, "platform",     "embedded");
     cJSON_AddStringToObject(client, "deviceFamily", "DuckyClaw");
-    cJSON_AddStringToObject(client, "displayName",  DUCKYCLAW_DEVICE_ID);
+    cJSON_AddStringToObject(client, "displayName",  s_device_id);
     cJSON_AddItemToObject(params, "client", client);
 
-    cJSON_AddStringToObject(auth, "token", OPENCLAW_GATEWAY_TOKEN);
+    cJSON_AddStringToObject(auth, "token", s_gw_token);
     cJSON_AddItemToObject(params, "auth", auth);
 
     cJSON_AddStringToObject(params, "role", "operator");
@@ -874,7 +902,7 @@ static OPERATE_RET __acp_push_notice_to_bus(const char *content, const char *tag
     char chat_id[sizeof(s_ctx.pending_chat_id)] = {0};
     size_t content_len;
     char *owned_content;
-    im_msg_t in = {0};
+    sys_msg_t in = {0};
 
     if (!content || content[0] == '\0') {
         return OPRT_INVALID_PARM;
@@ -906,7 +934,7 @@ static OPERATE_RET __acp_push_notice_to_bus(const char *content, const char *tag
     in.chat_id[sizeof(in.chat_id) - 1] = '\0';
     in.content = owned_content;
 
-    OPERATE_RET rt = message_bus_push_inbound(&in);
+    OPERATE_RET rt = sys_bus_push_inbound(&in);
     if (rt != OPRT_OK) {
         PR_ERR("acp %s inject failed channel=%s chat_id=%s rt=%d",
                tag ? tag : "notice", channel, chat_id, rt);
@@ -914,7 +942,7 @@ static OPERATE_RET __acp_push_notice_to_bus(const char *content, const char *tag
         return rt;
     }
 
-    PR_INFO("acp %s queued to message_bus channel=%s chat_id=%s",
+    PR_INFO("acp %s queued to sys_bus channel=%s chat_id=%s",
             tag ? tag : "notice", channel, chat_id);
     return OPRT_OK;
 }
@@ -1034,7 +1062,7 @@ static OPERATE_RET __acp_queue_reply_to_bus(const char *reply)
 static OPERATE_RET __acp_queue_timeout_to_bus(void)
 {
     static const char timeout_notice[] =
-        "System notification: OpenClaw did not return a final result within 180 seconds. "
+        "System notification: AI assistant did not return a final result within 180 seconds. "
         "Please tell the user that the previous ACP task timed out or the reply was lost, "
         "and suggest retrying if needed.";
 
@@ -1224,16 +1252,22 @@ static void __acp_dispatch(const char *text, size_t text_len)
 
     if (strcmp(type->valuestring, "event") == 0) {
         cJSON *event = cJSON_GetObjectItem(root, "event");
-        char   event_text[ACP_CLIENT_REPLY_BUF_SIZE] = {0};
+        char  *event_text = (char *)claw_malloc(ACP_CLIENT_REPLY_BUF_SIZE);
+        if (!event_text) {
+            cJSON_Delete(root);
+            return;
+        }
+        memset(event_text, 0, ACP_CLIENT_REPLY_BUF_SIZE);
         bool is_final = FALSE;
 
         if (!cJSON_IsString(event) || !event->valuestring) {
+            claw_free(event_text);
             cJSON_Delete(root);
             return;
         }
 
         if (strcmp(event->valuestring, "tick") != 0 &&
-            __acp_extract_event_text(root, event_text, sizeof(event_text))) {
+            __acp_extract_event_text(root, event_text, ACP_CLIENT_REPLY_BUF_SIZE)) {
             size_t text_size = strlen(event_text);
             memcpy(s_ctx.reply_buf, event_text, text_size);
             s_ctx.reply_buf[text_size] = '\0';
@@ -1273,6 +1307,8 @@ static void __acp_dispatch(const char *text, size_t text_len)
             PR_DEBUG("acp tick seq=%u (keepalive, no response needed)", (unsigned)seq);
         }
 
+        claw_free(event_text);
+
     } else if (strcmp(type->valuestring, "res") == 0) {
         /* connect response is handled synchronously in __acp_connect;
          * log unexpected res frames here for debug. */
@@ -1308,11 +1344,11 @@ static OPERATE_RET __connect_and_handshake(void)
     TUYA_IP_ADDR_T ip_addr = 0;
 
     /* Resolve host – try str2addr first (works for dotted-decimal IPs) */
-    ip_addr = tal_net_str2addr(OPENCLAW_GATEWAY_HOST);
+    ip_addr = tal_net_str2addr(s_gw_host);
     if (ip_addr == 0) {
-        OPERATE_RET rt = tal_net_gethostbyname(OPENCLAW_GATEWAY_HOST, &ip_addr);
+        OPERATE_RET rt = tal_net_gethostbyname(s_gw_host, &ip_addr);
         if (rt != OPRT_OK || ip_addr == 0) {
-            PR_ERR("acp dns resolve failed host=%s", OPENCLAW_GATEWAY_HOST);
+            PR_ERR("acp dns resolve failed host=%s", s_gw_host);
             return OPRT_NETWORK_ERROR;
         }
     }
@@ -1323,17 +1359,17 @@ static OPERATE_RET __connect_and_handshake(void)
         return OPRT_NETWORK_ERROR;
     }
 
-    OPERATE_RET rt = tal_net_connect(fd, ip_addr, OPENCLAW_GATEWAY_PORT);
+    OPERATE_RET rt = tal_net_connect(fd, ip_addr, (uint16_t)s_gw_port);
     if (rt != OPRT_OK) {
         PR_ERR("acp tcp connect failed rt=%d host=%s port=%u",
-               rt, OPENCLAW_GATEWAY_HOST, (unsigned)OPENCLAW_GATEWAY_PORT);
+               rt, s_gw_host, s_gw_port);
         tal_net_close(fd);
         return rt;
     }
-    PR_INFO("acp tcp connected fd=%d host=%s:%u",
-            fd, OPENCLAW_GATEWAY_HOST, (unsigned)OPENCLAW_GATEWAY_PORT);
+    PR_NOTICE("acp tcp connected fd=%d host=%s:%u",
+            fd, s_gw_host, s_gw_port);
 
-    rt = __ws_upgrade(fd, OPENCLAW_GATEWAY_HOST, OPENCLAW_GATEWAY_PORT);
+    rt = __ws_upgrade(fd, s_gw_host, (uint16_t)s_gw_port);
     if (rt != OPRT_OK) {
         tal_net_close(fd);
         return rt;
@@ -1383,7 +1419,7 @@ static void acp_client_task(void *arg)
 {
     (void)arg;
     static const char timeout_fallback[] =
-        "OpenClaw task timed out after 120 seconds. Please retry if needed.";
+        "AI assistant task timed out after 180 seconds. Please retry if needed.";
 
     PR_INFO("acp client task started");
 
@@ -1559,6 +1595,13 @@ OPERATE_RET __acp_client_init_evt_cb(void *data)
     s_ctx.fd    = -1;
     s_ctx.state = ACP_STATE_DISCONNECTED;
 
+    acp_load_config();
+
+    if (s_gw_token[0] == '\0' || s_device_id[0] == '\0' || s_gw_host[0] == '\0') {
+        PR_WARN("acp_client: gateway config incomplete (token/device_id/host empty), skip initialization");
+        return OPRT_OK;
+    }
+
     OPERATE_RET rt = tal_mutex_create_init(&s_ctx.tx_mutex);
     if (rt != OPRT_OK) {
         PR_ERR("acp mutex create failed rt=%d", rt);
@@ -1577,7 +1620,7 @@ OPERATE_RET __acp_client_init_evt_cb(void *data)
         return rt;
     }
 
-#if defined(ACP_CLIENT_STACK_SIZE) && (ACP_CLIENT_STACK_SIZE > 0)
+#if defined(ACP_CLIENT_STACK_SIZE)
     THREAD_CFG_T cfg = {0};
     cfg.stackDepth = ACP_CLIENT_STACK_SIZE;
     cfg.priority   = THREAD_PRIO_1;
@@ -1595,7 +1638,7 @@ OPERATE_RET __acp_client_init_evt_cb(void *data)
 #endif
 
     PR_INFO("acp client init ok host=%s port=%u",
-            OPENCLAW_GATEWAY_HOST, (unsigned)OPENCLAW_GATEWAY_PORT);
+            s_gw_host, s_gw_port);
     return OPRT_OK;
 }
 
@@ -1605,8 +1648,8 @@ OPERATE_RET __acp_client_init_evt_cb(void *data)
  */
 OPERATE_RET acp_client_init(void)
 {
-    PR_INFO("app im wait network...");
-#if defined(ACP_CLIENT_STACK_SIZE) && (ACP_CLIENT_STACK_SIZE > 0)
+#if defined(ACP_CLIENT_STACK_SIZE)
+    PR_INFO("acp client init wait network...");
     tal_event_subscribe(EVENT_MQTT_CONNECTED, "acp_client_init", __acp_client_init_evt_cb, SUBSCRIBE_TYPE_NORMAL);
 #endif
     return OPRT_OK;

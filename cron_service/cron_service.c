@@ -8,7 +8,7 @@
  *
  * Implements a cron-like scheduler that supports recurring ("every") and
  * one-shot ("at") jobs. Jobs are persisted to a JSON file on the filesystem.
- * When a job fires, it injects a message via message_bus_push_inbound so the
+ * When a job fires, it injects a message via sys_bus_push_inbound so the
  * agent_loop handles the full AI interaction and forwards the reply to IM.
  */
 
@@ -17,7 +17,7 @@
 
 #include "tal_api.h"
 #include "tal_time_service.h"
-#include "bus/message_bus.h"
+#include "sys_bus.h"
 #include "cJSON.h"
 
 #include <string.h>
@@ -329,8 +329,14 @@ static void cron_process_due_jobs(void)
             if (is_overdue) {
                 PR_WARN("Cron overdue: '%s' (%s) missed by %llds", job->name, job->id,
                         (long long)late_secs);
-                char msg[512];
-                snprintf(msg, sizeof(msg),
+                char *msg = (char *)claw_malloc(512);
+                if (!msg) {
+                    PR_ERR("cron: malloc failed for overdue msg");
+                    job->enabled = false;
+                    changed = true;
+                    continue;
+                }
+                snprintf(msg, 512,
                          "[Task Overdue] Task '%s' (id=%s) was scheduled at epoch %lld "
                          "but missed its trigger window by %llds. "
                          "Please inform the user that this reminder was not delivered on time, "
@@ -338,15 +344,11 @@ static void cron_process_due_jobs(void)
                          "To delete, call cron_remove with job_id='%s'.",
                          job->name, job->id, (long long)job->at_epoch,
                          (long long)late_secs, job->id);
-                im_msg_t im = {0};
-                strncpy(im.channel, "cron", sizeof(im.channel) - 1);
-                im.content = claw_malloc(strlen(msg) + 1);
-                if (im.content) {
-                    strncpy(im.content, msg, strlen(msg) + 1);
-                    (void)message_bus_push_inbound(&im);
-                } else {
-                    PR_ERR("cron: malloc failed for overdue msg");
-                }
+                PR_INFO("Cron overdue msg: %s", msg);
+                sys_msg_t im = {0};
+                strncpy(im.channel, SYS_CHAN_CRON, sizeof(im.channel) - 1);
+                im.content = msg;
+                (void)sys_bus_push_inbound(&im);
                 /* Disable so it is not reported again on the next check */
                 job->enabled = false;
                 changed = true;
@@ -356,14 +358,24 @@ static void cron_process_due_jobs(void)
 
         /* Case 3: Reached reminder time → remind user, then delete/reschedule */
         PR_INFO("Cron firing: '%s' (%s)", job->name, job->id);
-        im_msg_t im = {0};
-        strncpy(im.channel, "cron", sizeof(im.channel) - 1);
-        im.content = claw_malloc(strlen(job->message) + 1);
-        if (im.content) {
-            strncpy(im.content, job->message, strlen(job->message) + 1);
-            (void)message_bus_push_inbound(&im);
-        } else {
-            PR_ERR("cron: malloc failed for job '%s'", job->name);
+        {
+            /* Wrap the raw message with a [Cron Reminder] frame so the AI
+             * knows this is a scheduled reminder to relay, not a user message. */
+            const char *fmt =
+                "[Cron Reminder] The following scheduled reminder just fired "
+                "(job '%s', id=%s). Deliver this message to the user in a "
+                "warm, friendly reminder tone:\n%s";
+            size_t needed = strlen(fmt) + strlen(job->name) +
+                            strlen(job->id) + strlen(job->message) + 1;
+            sys_msg_t im = {0};
+            strncpy(im.channel, SYS_CHAN_CRON, sizeof(im.channel) - 1);
+            im.content = claw_malloc(needed);
+            if (im.content) {
+                snprintf(im.content, needed, fmt, job->name, job->id, job->message);
+                (void)sys_bus_push_inbound(&im);
+            } else {
+                PR_ERR("cron: malloc failed for job '%s'", job->name);
+            }
         }
         job->last_run = now;
 

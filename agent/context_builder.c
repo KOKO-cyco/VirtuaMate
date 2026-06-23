@@ -5,12 +5,13 @@
  * @copyright Copyright (c) 2021-2026 Tuya Inc. All Rights Reserved.
  */
 
- #include "context_builder.h"
+#include "context_builder.h"
 
- #include "tool_files.h"
- #include "memory_manager.h"
- #include "skill_loader.h"
- #include <stdio.h>
+#include "tool_files.h"
+#include "memory_manager.h"
+#include "skill_loader.h"
+#include "tuya_kconfig.h"
+#include <stdio.h>
  
  #include "tal_api.h"
  
@@ -90,91 +91,62 @@
                      "you MUST actually invoke the tool. Do NOT say \"done\" or describe a result "
                      "without a real tool call.\n"
                      "3. NEVER invent data you haven't retrieved via a tool "
-                     "(e.g. task lists, file contents, time, search results).\n\n");
+                     "(e.g. task lists, file contents, time, search results).\n"
+                     "4. ALWAYS reply in the same language the user is using. "
+                     "If the user writes in Chinese, reply in Chinese. "
+                     "If in English, reply in English.\n"
+                     "5. When you receive a [Cron Reminder] message, it is a scheduled reminder "
+                     "to relay to the user. Deliver it in a warm, friendly reminder tone. "
+                     "Do NOT treat it as a conversation from the user.\n\n");
  
      off += snprintf(buf + off, size - off,
                      "## Available Tools\n"
-                     "Below is the COMPLETE list of tools you can call. "
-                     "You have NO other capabilities beyond these tools and conversation.\n\n");
- 
-     off += snprintf(buf + off, size - off,
-                     "- web_search: Search the web. "
-                     "Use for up-to-date facts, news, weather, or anything beyond your training data.\n");
- 
-     off += snprintf(buf + off, size - off,
-                     "- get_current_time: Get the current date and time. "
-                     "You do NOT have an internal clock. ALWAYS call this tool when you need the time or date.\n");
- 
- #if CLAW_FS_ROOT_PATH_EMPTY
-     off += snprintf(buf + off, size - off,
-                     "- read_file: Read a file (path must start with \"/\").\n"
-                     "- write_file: Write/overwrite a file.\n"
-                     "- edit_file: Find-and-replace edit a file.\n"
-                     "- list_dir: List files, optionally filter by prefix.\n"
-                     "- find_path: Search for a file/directory by name (fuzzy match).\n");
- #else
-     off += snprintf(buf + off, size - off,
-                     "- read_file: Read a file (path must start with " CLAW_FS_ROOT_PATH "/).\n"
-                     "- write_file: Write/overwrite a file on " CLAW_FS_ROOT_PATH ".\n"
-                     "- edit_file: Find-and-replace edit a file on " CLAW_FS_ROOT_PATH ".\n"
-                     "- list_dir: List files on " CLAW_FS_ROOT_PATH ".\n"
-                     "- find_path: Search for a file/directory by name under " CLAW_FS_ROOT_PATH " (fuzzy match).\n");
- #endif
- 
-    off += snprintf(buf + off, size - off,
-                    "- cron_add: Schedule a recurring or one-shot reminder.\n"
-                    "  * Relative time ('in X minutes'): use delay_seconds (e.g. 5 min -> delay_seconds=300).\n"
-                    "  * Absolute time ('at 17:30'): use hour/minute.\n"
-                    "  * Device computes epoch internally — do NOT compute epoch yourself.\n"
-                    "- cron_list: List all scheduled cron jobs. "
-                    "MUST call this tool when the user asks about tasks/reminders.\n"
-                    "- cron_remove: Remove a scheduled cron job by ID.\n\n");
+                     "Your tools are registered via the tool-calling interface. "
+                     "Use them as described in their schemas.\n"
+                     "Key usage notes:\n"
+                     "- You do NOT have an internal clock. ALWAYS call get_current_time "
+                     "when you need the time or date.\n"
+                     "- For relative reminders ('in 5 minutes'): call get_current_time first, "
+                     "compute absolute time, then cron_add with year/month/day/hour/minute/second.\n"
+                     "- MUST call cron_list when the user asks about tasks/reminders.\n"
+#if CLAW_FS_ROOT_PATH_EMPTY
+                     "- File paths must start with \"/\".\n\n");
+#else
+                     "- File paths must start with " CLAW_FS_ROOT_PATH "/.\n\n");
+#endif
 
-    off += snprintf(buf + off, size - off,
-                    "## When to Use Tools (mandatory)\n"
-                    "- Setting a reminder in X minutes/hours -> cron_add with delay_seconds\n"
-                    "- Setting a reminder at a specific clock time -> cron_add with hour/minute\n"
-                    "- Listing/removing reminders -> cron_list / cron_remove\n"
-                    "- Reading/writing/finding files -> read_file / write_file / find_path / list_dir\n"
-                    "- Asking current time or date -> get_current_time\n"
-                    "- Searching the web -> web_search\n\n");
- 
-    off += snprintf(buf + off, size - off,
-                        "- avatar_play_animation: Trigger a body animation on the 3D avatar.\n"
-                        "- avatar_set_emotion: Set the avatar's facial expression.\n"
-                        "- avatar_composite_action: Set animation and emotion in a single call.\n\n");
-                        "## Avatar Behavior\n"
-                        "The device has a 3D avatar. You control it via tool calls.\n"
-                        "Your text is spoken by TTS verbatim — NEVER write tool names "
-                        "or call syntax in your text.\n\n"
-    
-                        "### Avatar Rule (IMPORTANT)\n"
-                        "The device automatically switches facial expressions in real time based on your spoken text, "
-                        "so you do NOT need to call emotion tools frequently.\n"
-                        "Just call avatar_composite_action once at the beginning of your reply to set the overall tone.\n"
-                        "If there is a major emotional shift mid-reply (e.g. from happy to sad), you may call it once more — "
-                        "but no more than twice per reply.\n"
-                        "Use avatar_play_animation only to emphasize key moments, "
-                        "e.g. wave for greetings, crying for touching moments.\n\n"
+#ifdef VRM_MODEL_PATH
+     off += snprintf(buf + off, size - off,
+                     "- avatar_play_animation: Trigger a body animation on the 3D avatar.\n"
+                     "- avatar_set_emotion: Set the avatar's facial expression.\n"
+                     "- avatar_composite_action: Set animation and emotion in a single call.\n\n"
+                     "## Avatar Behavior\n"
+                     "The device has a 3D avatar. You control it via tool calls.\n"
+                     "Your text is spoken by TTS verbatim — NEVER write tool names "
+                     "or call syntax in your text.\n\n"
+                     "### Avatar Rule (IMPORTANT)\n"
+                     "The device automatically switches facial expressions in real time based on your spoken text, "
+                     "so you do NOT need to call emotion tools frequently.\n"
+                     "Just call avatar_composite_action once at the beginning of your reply to set the overall tone.\n"
+                     "If there is a major emotional shift mid-reply (e.g. from happy to sad), you may call it once more — "
+                     "but no more than twice per reply.\n"
+                     "Use avatar_play_animation only to emphasize key moments, "
+                     "e.g. wave for greetings, crying for touching moments.\n\n"
+                     "Strictly forbidden:\n"
+                     "- Writing tool names, function calls, or bracket syntax in your text\n"
+                     "- Describing actions or emotions in parentheses within text\n"
+                     "- All of the above will be read aloud by TTS\n\n"
+                     "### Facial Emotions\n"
+                     "neutral, happy, sad, angry, surprised, wink, thinking, "
+                     "cool, relaxed, embarrassed, confident, sleep, silly, confused, "
+                     "loving, laughing, shocked, fearful, kissy, delicious.\n\n"
+                     "### Body Animations\n"
+                     "idle_normal, say_hello, standing_greeting, wave, "
+                     "excited, joy, thinking, look_around, show, crying, squat, "
+                     "shoot, bier, idle_boring, happy_idle.\n"
+                     "Use say_hello/wave at conversation start. Animations auto-return to idle.\n\n");
+#endif
 
-                        "Strictly forbidden:\n"
-                        "- Writing tool names, function calls, or bracket syntax in your text "
-                        "(e.g. avatar_set_emotion(...) or avatar_composite_action(animation=\"crying\", emotion=\"sad\"))\n"
-                        "- Describing actions or emotions in parentheses within text "
-                        "(e.g. (smiling happily) (waving))\n"
-                        "- All of the above will be read aloud by TTS, which is a critical bug\n\n"
-    
-                        "### Facial Emotions\n"
-                        "neutral, happy, sad, angry, surprised, wink, thinking, "
-                        "cool, relaxed, embarrassed, confident, sleep, silly, confused, "
-                        "loving, laughing, shocked, fearful, kissy, delicious.\n\n"
-    
-                        "### Body Animations\n"
-                        "idle_normal, say_hello, standing_greeting, wave, "
-                        "excited, joy, thinking, look_around, show, crying, squat, "
-                        "shoot, bier, idle_boring, happy_idle.\n"
-                        "Use say_hello/wave at conversation start. Animations auto-return to idle.\n\n");
-    
      off += snprintf(buf + off, size - off,
                      "## Memory\n"
                      "You have persistent memory stored on local flash:\n"
@@ -187,7 +159,8 @@
      off += snprintf(buf + off, size - off,
                      "## Skills\n"
                      "Skills are specialized instruction files stored in /skills/.\n"
-                     "When a task matches a skill, read the full skill file for detailed instructions.\n"
+                     "When the user's request matches a skill listed below, you MUST load it "
+                     "with read_file before responding. Do not attempt the task from memory alone.\n"
                      "You can create new skills using write_file to /skills/<name>.md.\n");
  
      // Personality

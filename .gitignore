@@ -1,3 +1,13 @@
+# output
+dist
+.build
+.cache
+.cursor
+.claude
+ai_components/assets/include/lang_config.h
+compile_commands.json
+tuya_app_config_secrets.h
+
 # Prerequisites
 *.d
 
@@ -41,6 +51,10 @@
 *.su
 *.idb
 *.pdb
+*.build
+app_default.config
+doc/
+monitor.log
 
 # Kernel Module Compile Results
 *.mod*

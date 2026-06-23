@@ -1,9 +1,4 @@
 menu "Tools (Filesystem) Config"
-    config CLAW_USE_SDCARD
-        bool "Use SD card for filesystem"
-        default n
-        help
-            When enabled (y), use SD card filesystem (tkl_fs, root /sdcard).
-            When disabled (n), use internal flash (tal_fs).
-            Typically disable on Linux (PLATFORM_LINUX) targets.
+    comment "Linux targets use the local filesystem (tal_fs). MCU-only options"
+    comment "(SD card, hardware MCP, embedded Lua) are not available in this fork."
 endmenu

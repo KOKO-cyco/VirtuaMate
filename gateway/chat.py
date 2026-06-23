@@ -1,5 +1,9 @@
-
+# python3 -m venv .venv
+# source .venv/bin/activate
 # pip install websockets
+# python3 gateway/chat.py
+# deactivate
+
 import asyncio
 import json
 

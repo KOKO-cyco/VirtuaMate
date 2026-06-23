@@ -206,8 +206,9 @@ static OPERATE_RET __tool_get_current_time(const MCP_PROPERTY_LIST_T *properties
     /* Pass 0 so tal_time_get_local_time_custom uses current time internally */
     __to_local_tm(0, &tm_local, tz_label, sizeof(tz_label));
 
-    char result[512];
-    snprintf(result, sizeof(result),
+    char *result = (char *)claw_malloc(512);
+    if (!result) { return OPRT_MALLOC_FAILED; }
+    snprintf(result, 512,
              "Current time: %04d-%02d-%02d %02d:%02d:%02d %s (UTC epoch=%lld). "
              "To schedule a reminder, call cron_add with the desired "
              "year/month/day/hour/minute/second. For relative delays such as "
@@ -217,12 +218,14 @@ static OPERATE_RET __tool_get_current_time(const MCP_PROPERTY_LIST_T *properties
              tm_local.tm_hour, tm_local.tm_min, tm_local.tm_sec,
              tz_label, (long long)now);
 
+    /* ai_mcp_return_value_set_str() copies via mm_strdup, safe to free after */
     ai_mcp_return_value_set_str(ret_val, result);
     PR_DEBUG("get_current_time: epoch=%lld local=%04d-%02d-%02d %02d:%02d:%02d %s",
              (long long)now,
              tm_local.tm_year + 1900, tm_local.tm_mon + 1, tm_local.tm_mday,
              tm_local.tm_hour, tm_local.tm_min, tm_local.tm_sec,
              tz_label);
+    claw_free(result);
     return OPRT_OK;
 }
 
@@ -313,61 +316,46 @@ static OPERATE_RET __tool_cron_add(const MCP_PROPERTY_LIST_T *properties,
     } else if (strcmp(schedule_type, "at") == 0) {
         job.kind = CRON_KIND_AT;
 
-        int64_t now = (int64_t)tal_time_get_posix();
+        /* Compute at_epoch inside cron_add from local datetime fields.
+         * at_epoch is kept as a compatibility fallback for older callers. */
+        int year = 0, month = 0, day = 0, hour = 0, minute = 0, second = 0;
+        int at_epoch = 0;
+        bool has_at_epoch = __get_int_prop(properties, "at_epoch", &at_epoch) && at_epoch > 0;
 
-        /* Priority 1: delay_seconds — relative offset from now */
-        int delay_seconds = 0;
-        bool has_delay = __get_int_prop(properties, "delay_seconds", &delay_seconds);
-        if (has_delay && delay_seconds > 0) {
-            job.at_epoch = now + (int64_t)delay_seconds;
-            PR_DEBUG("cron_add: delay_seconds=%d -> at_epoch=%lld (now=%lld)",
-                     delay_seconds, (long long)job.at_epoch, (long long)now);
-        } else {
-            /* Priority 2: datetime parameters (hour/minute with non-zero value) */
-            int year = 0, month = 0, day = 0, hour = 0, minute = 0, second = 0;
-            int at_epoch = 0;
-            bool has_at_epoch = __get_int_prop(properties, "at_epoch", &at_epoch) && at_epoch > 0;
+        bool has_hour   = __get_int_prop(properties, "hour",   &hour);
+        bool has_minute = __get_int_prop(properties, "minute", &minute);
 
-            bool has_hour   = __get_int_prop(properties, "hour",   &hour);
-            bool has_minute = __get_int_prop(properties, "minute", &minute);
+        if (has_hour || has_minute) {
+            char err_msg[160];
 
-            if ((has_hour && hour > 0) || (has_minute && minute > 0)) {
-                char err_msg[160];
+            __get_int_prop(properties, "year",   &year);
+            __get_int_prop(properties, "month",  &month);
+            __get_int_prop(properties, "day",    &day);
+            __get_int_prop(properties, "second", &second);
 
-                __get_int_prop(properties, "year",   &year);
-                __get_int_prop(properties, "month",  &month);
-                __get_int_prop(properties, "day",    &day);
-                __get_int_prop(properties, "second", &second);
-
-                if (__resolve_local_datetime_to_epoch(year, month, day,
-                                                      hour, minute, second,
-                                                      &job.at_epoch, err_msg,
-                                                      sizeof(err_msg)) != OPRT_OK) {
-                    ai_mcp_return_value_set_str(ret_val, err_msg);
-                    return OPRT_INVALID_PARM;
-                }
-            } else if (has_at_epoch) {
-                job.at_epoch = (int64_t)at_epoch;
-                PR_DEBUG("cron_add: using compatibility at_epoch=%d", at_epoch);
-            } else {
-                ai_mcp_return_value_set_str(ret_val,
-                    "Error: 'at' schedule requires delay_seconds, hour/minute, "
-                    "or compatibility at_epoch");
+            if (__resolve_local_datetime_to_epoch(year, month, day,
+                                                  hour, minute, second,
+                                                  &job.at_epoch, err_msg,
+                                                  sizeof(err_msg)) != OPRT_OK) {
+                ai_mcp_return_value_set_str(ret_val, err_msg);
                 return OPRT_INVALID_PARM;
             }
+        } else if (has_at_epoch) {
+            job.at_epoch = (int64_t)at_epoch;
+            PR_DEBUG("cron_add: using compatibility at_epoch=%d", at_epoch);
+        } else {
+            ai_mcp_return_value_set_str(ret_val,
+                "Error: 'at' schedule requires year/month/day/hour/minute "
+                "or compatibility at_epoch");
+            return OPRT_INVALID_PARM;
         }
 
+        int64_t now = (int64_t)tal_time_get_posix();
         if (job.at_epoch <= now) {
-            char err_msg[256];
-            POSIX_TM_S tm_now;
-            char tz_label[16];
-            __to_local_tm(now, &tm_now, tz_label, sizeof(tz_label));
+            char err_msg[128];
             snprintf(err_msg, sizeof(err_msg),
-                     "Error: target time is in the past (now=%lld, %04d-%02d-%02d %02d:%02d:%02d %s). "
-                     "For relative delays, use delay_seconds instead of hour/minute.",
-                     (long long)now,
-                     tm_now.tm_year + 1900, tm_now.tm_mon + 1, tm_now.tm_mday,
-                     tm_now.tm_hour, tm_now.tm_min, tm_now.tm_sec, tz_label);
+                     "Error: at_epoch %lld is in the past (now=%lld)",
+                     (long long)job.at_epoch, (long long)now);
             ai_mcp_return_value_set_str(ret_val, err_msg);
             return OPRT_INVALID_PARM;
         }
@@ -406,13 +394,16 @@ static OPERATE_RET __tool_cron_add(const MCP_PROPERTY_LIST_T *properties,
     }
 
     if (!found) {
-        char err_msg[256];
-        snprintf(err_msg, sizeof(err_msg),
+        char *err_msg = (char *)claw_malloc(256);
+        if (!err_msg) { return OPRT_MALLOC_FAILED; }
+        snprintf(err_msg, 256,
                  "Error: job '%s' (id=%s) was scheduled but not found in stored list "
                  "- possible file write failure. Please retry.",
                  job.name, job.id);
         PR_ERR("cron_add verify failed: %s", err_msg);
+        /* ai_mcp_return_value_set_str() copies via mm_strdup, safe to free after */
         ai_mcp_return_value_set_str(ret_val, err_msg);
+        claw_free(err_msg);
         return OPRT_FILE_WRITE_FAILED;
     }
 
@@ -421,9 +412,12 @@ static OPERATE_RET __tool_cron_add(const MCP_PROPERTY_LIST_T *properties,
     char tz_label[16];
     __to_local_tm(job.next_run, &tm_next, tz_label, sizeof(tz_label));
 
-    char result[320];
+    char *result = (char *)claw_malloc(320);
+    if (!result) {
+        return OPRT_MALLOC_FAILED;
+    }
     if (job.kind == CRON_KIND_EVERY) {
-        snprintf(result, sizeof(result),
+        snprintf(result, 320,
                  "OK: Added recurring job '%s' (id=%s), runs every %lu seconds. "
                  "Next run at epoch %lld (%04d-%02d-%02d %02d:%02d:%02d %s). "
                  "Verified in stored list.",
@@ -434,7 +428,7 @@ static OPERATE_RET __tool_cron_add(const MCP_PROPERTY_LIST_T *properties,
         POSIX_TM_S tm_at;
         char tz_label_at[16];
         __to_local_tm(job.at_epoch, &tm_at, tz_label_at, sizeof(tz_label_at));
-        snprintf(result, sizeof(result),
+        snprintf(result, 320,
                  "OK: Added one-shot job '%s' (id=%s), fires at epoch %lld "
                  "(%04d-%02d-%02d %02d:%02d:%02d %s).%s Verified in stored list.",
                  job.name, job.id, (long long)job.at_epoch,
@@ -443,8 +437,10 @@ static OPERATE_RET __tool_cron_add(const MCP_PROPERTY_LIST_T *properties,
                  job.delete_after_run ? " Will be deleted after firing." : "");
     }
 
+    /* ai_mcp_return_value_set_str() copies via mm_strdup, safe to free after */
     ai_mcp_return_value_set_str(ret_val, result);
     PR_DEBUG("cron_add: %s", result);
+    claw_free(result);
     return OPRT_OK;
 }
 
@@ -550,9 +546,10 @@ OPERATE_RET tool_cron_register(void)
         "get_current_time",
         "Get the device's current local date and time (and UTC epoch).\n"
         "Call this when the user asks what time/date it is.\n"
-        "For scheduling a reminder, use cron_add with delay_seconds for relative\n"
-        "delays (e.g. 'in 5 minutes' -> delay_seconds=300), or hour/minute for\n"
-        "absolute times. No need to call get_current_time first for relative delays.",
+        "For reminders, ALWAYS call this tool first if the user gives a relative\n"
+        "delay such as 'in 5 minutes'. Use the returned current time to compute\n"
+        "the next absolute local target time, then call cron_add with those\n"
+        "year/month/day/hour/minute/second fields.",
         __tool_get_current_time,
         NULL
     ));
@@ -564,17 +561,28 @@ OPERATE_RET tool_cron_register(void)
         "Parameters:\n"
         "- name (string): Descriptive name for the job.\n"
         "- schedule_type (string): 'every' for recurring or 'at' for one-shot.\n"
-        "- message (string): Message content to send when the job fires.\n"
+        "- message (string): The reminder content to deliver when the job fires.\n"
+        "  Write a brief, factual note about what the user wanted to be reminded of\n"
+        "  (e.g. 'Time to drink water', 'Meeting starts in 10 minutes').\n"
+        "  Do NOT write it in a conversational tone — the system frames it as a reminder automatically.\n"
         "- interval_s (int): Interval in seconds (required for 'every' type).\n"
-        "For 'at' type, THREE ways to specify the target time (checked in order):\n"
-        "  1. delay_seconds (int): Seconds from now. PREFERRED for relative requests\n"
-        "     like 'remind me in 5 minutes' -> delay_seconds=300.\n"
-        "  2. hour/minute (int): Absolute clock time today (or on the given date).\n"
-        "     Example: 'remind me at 17:30' -> hour=17, minute=30.\n"
-        "  3. at_epoch (int): Raw UTC epoch timestamp (compatibility fallback).\n"
-        "IMPORTANT: For relative time requests ('in X minutes/hours'),\n"
-        "ALWAYS use delay_seconds. Do NOT use hour/minute for relative offsets.\n"
-        "- delete_after_run (bool): Auto-delete after firing (default true for 'at').\n"
+        "For 'at' type, use this workflow:\n"
+        "  1. If the request is relative (e.g. 'in 5 minutes'), call get_current_time first.\n"
+        "  2. Compute the NEXT absolute local target time.\n"
+        "  3. Call cron_add with year/month/day/hour/minute/second.\n"
+        "  4. cron_add will internally convert that local date/time to the correct epoch.\n"
+        "Primary parameters for 'at' type:\n"
+        "- year (int): Full year, e.g. 2026.\n"
+        "- month (int): Month 1-12.\n"
+        "- day (int): Day 1-31.\n"
+        "- hour (int): Hour 0-23.\n"
+        "- minute (int): Minute 0-59.\n"
+        "- second (int): Optional, default 0.\n"
+        "- at_epoch (int): Compatibility fallback for older callers; new flows should not need it.\n"
+        "- delete_after_run (bool): Whether to auto-delete after firing (default true for 'at').\n"
+        "Important:\n"
+        "- DO NOT pass minute=10 or minute=5 as a relative offset.\n"
+        "- Always convert relative reminders into an absolute local date/time first.\n"
         "Response:\n"
         "- Returns job ID and schedule details on success, including 'Verified in stored list'.\n"
         "- If the response does NOT contain 'Verified in stored list', the file write failed;\n"
@@ -587,16 +595,11 @@ OPERATE_RET tool_cron_register(void)
         &(MCP_PROPERTY_DEF_T){ .name = "interval_s", .type = MCP_PROPERTY_TYPE_INTEGER,
             .description = "Interval in seconds for 'every' schedule type",
             .has_default = TRUE, .default_val.int_val = 0, .has_range = FALSE },
-        &(MCP_PROPERTY_DEF_T){ .name = "delay_seconds", .type = MCP_PROPERTY_TYPE_INTEGER,
-            .description = "Seconds from now (for 'at' type). "
-                           "Use this for relative requests like 'in 5 minutes' -> 300. "
-                           "Takes priority over hour/minute/at_epoch.",
-            .has_default = TRUE, .default_val.int_val = 0, .has_range = FALSE },
         &(MCP_PROPERTY_DEF_T){ .name = "hour", .type = MCP_PROPERTY_TYPE_INTEGER,
-            .description = "Hour 0-23 for absolute clock time (for 'at' type)",
+            .description = "Absolute local clock hour 0-23 for 'at' type; not a relative offset",
             .has_default = TRUE, .default_val.int_val = 0, .has_range = FALSE },
         &(MCP_PROPERTY_DEF_T){ .name = "minute", .type = MCP_PROPERTY_TYPE_INTEGER,
-            .description = "Minute 0-59 for absolute clock time (for 'at' type)",
+            .description = "Absolute local clock minute 0-59 for 'at' type; not a relative offset like '5 minutes from now'",
             .has_default = TRUE, .default_val.int_val = 0, .has_range = FALSE },
         &(MCP_PROPERTY_DEF_T){ .name = "year", .type = MCP_PROPERTY_TYPE_INTEGER,
             .description = "Full year e.g. 2026 (optional, defaults to today)",
@@ -611,7 +614,7 @@ OPERATE_RET tool_cron_register(void)
             .description = "Second 0-59 (optional, default 0)",
             .has_default = TRUE, .default_val.int_val = 0, .has_range = FALSE },
         &(MCP_PROPERTY_DEF_T){ .name = "at_epoch", .type = MCP_PROPERTY_TYPE_INTEGER,
-            .description = "UTC epoch (alternative, used only if delay_seconds and hour/minute absent)",
+            .description = "UTC epoch compatibility fallback for older callers; new reminder flows should pass local date/time fields instead",
             .has_default = TRUE, .default_val.int_val = 0, .has_range = FALSE },
         MCP_PROP_BOOL_DEF("delete_after_run", "Auto-delete after firing (default true for 'at')", true)
     ));

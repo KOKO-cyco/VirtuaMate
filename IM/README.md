@@ -15,6 +15,7 @@ The entire `IM/` directory can be copied into any TuyaOpen project. The only ext
 | **Telegram** | HTTPS long-poll (`getUpdates`) | Text, document metadata | Text (Markdown + plain fallback) |
 | **Discord** | WebSocket Gateway (v10) | Text, attachment metadata | Text (REST API) |
 | **Feishu (Lark)** | WebSocket + Protobuf frames | Text, post, interactive card, share | Text (REST API) |
+| **QQ Bot** | WebSocket Gateway (v2) + REST | Text (C2C private + group @mention) | Text (REST API) |
 
 ### Key Design
 
@@ -35,9 +36,11 @@ IM/
 ├── bus/
 │   └── message_bus.h / .c  # Inbound / outbound message queues (im_msg_t)
 ├── channels/
-│   ├── telegram_bot.h / .c # Telegram Bot — HTTPS long-poll + send
-│   ├── discord_bot.h / .c  # Discord Bot — WebSocket Gateway + REST send
-│   └── feishu_bot.h / .c   # Feishu Bot — WebSocket + Protobuf + REST send
+│   ├── telegram_bot.h / .c    # Telegram Bot — HTTPS long-poll + send
+│   ├── discord_bot.h / .c     # Discord Bot — WebSocket Gateway (v10) + REST send
+│   ├── feishu_bot.h / .c      # Feishu Bot — WebSocket + Protobuf + REST send
+│   ├── weixin_bot.h / .c      # WeChat iLink Bot — HTTPS long-poll + send
+│   └── qqbot_channel.h / .c   # QQ Bot — WebSocket Gateway (v2) + REST send
 ├── proxy/
 │   └── http_proxy.h / .c   # HTTP CONNECT / SOCKS5 proxy tunnel
 ├── certs/
@@ -71,6 +74,11 @@ Configuration is layered, from lowest to highest priority:
 #define IM_SECRET_FS_APP_ID      "cli_xxxx"
 #define IM_SECRET_FS_APP_SECRET  "xxxx"
 #define IM_SECRET_FS_ALLOW_FROM  "ou_xxxx,ou_yyyy"
+
+// QQ Bot
+#define IM_SECRET_QQ_APP_ID        "12345678"
+#define IM_SECRET_QQ_CLIENT_SECRET "your-client-secret"
+#define IM_SECRET_CHANNEL_MODE     "qqbot"
 
 // Proxy (optional)
 #define IM_SECRET_PROXY_HOST     "192.168.1.100"
@@ -148,6 +156,11 @@ while (1) {
 | | `feishu_set_app_id(id)` | Update App ID at runtime |
 | | `feishu_set_app_secret(secret)` | Update App Secret at runtime |
 | | `feishu_set_allow_from(csv)` | Update allowed sender list |
+| **qqbot** | `qqbot_channel_init()` | Load App ID & client secret from secrets / NVS |
+| | `qqbot_channel_start()` | Start token-refresh thread + WebSocket gateway thread |
+| | `qqbot_send_message(chat_id, text)` | Send text; `chat_id` = `c2c:<openid>` or `group:<group_openid>` |
+| | `qqbot_set_app_id(id)` | Update App ID at runtime (persists to NVS) |
+| | `qqbot_set_client_secret(secret)` | Update client secret at runtime (persists to NVS) |
 | **proxy** | `http_proxy_init()` | Load proxy settings from secrets / NVS |
 | | `http_proxy_is_enabled()` | Check if proxy is configured |
 | | `http_proxy_set(host, port, type)` | Configure proxy at runtime |
@@ -168,6 +181,7 @@ IM 是一个独立的、可复用的即时通讯组件，基于 [TuyaOpen](https
 | **Telegram** | HTTPS 长轮询（`getUpdates`） | 文本、文档元数据 | 文本（Markdown + 纯文本回退） |
 | **Discord** | WebSocket Gateway (v10) | 文本、附件元数据 | 文本（REST API） |
 | **飞书** | WebSocket + Protobuf 帧 | 文本、富文本、卡片消息、分享 | 文本（REST API） |
+| **QQ Bot** | WebSocket Gateway (v2) + REST | 文本（私聊 + 群组 @机器人） | 文本（REST API） |
 
 ### 核心设计
 
@@ -188,9 +202,11 @@ IM/
 ├── bus/
 │   └── message_bus.h / .c  # 入站 / 出站消息队列（im_msg_t）
 ├── channels/
-│   ├── telegram_bot.h / .c # Telegram Bot — HTTPS 长轮询 + 发送
-│   ├── discord_bot.h / .c  # Discord Bot — WebSocket Gateway + REST 发送
-│   └── feishu_bot.h / .c   # 飞书 Bot — WebSocket + Protobuf + REST 发送
+│   ├── telegram_bot.h / .c  # Telegram Bot — HTTPS 长轮询 + 发送
+│   ├── discord_bot.h / .c   # Discord Bot — WebSocket Gateway (v10) + REST 发送
+│   ├── feishu_bot.h / .c    # 飞书 Bot — WebSocket + Protobuf + REST 发送
+│   ├── weixin_bot.h / .c    # 微信 iLink Bot — HTTPS 长轮询 + 发送
+│   └── qqbot_channel.h / .c # QQ Bot — WebSocket Gateway (v2) + REST 发送
 ├── proxy/
 │   └── http_proxy.h / .c   # HTTP CONNECT / SOCKS5 代理隧道
 ├── certs/
@@ -224,6 +240,11 @@ IM/
 #define IM_SECRET_FS_APP_ID      "cli_xxxx"
 #define IM_SECRET_FS_APP_SECRET  "xxxx"
 #define IM_SECRET_FS_ALLOW_FROM  "ou_xxxx,ou_yyyy"
+
+// QQ Bot
+#define IM_SECRET_QQ_APP_ID        "12345678"
+#define IM_SECRET_QQ_CLIENT_SECRET "your-client-secret"
+#define IM_SECRET_CHANNEL_MODE     "qqbot"
 
 // 代理（可选）
 #define IM_SECRET_PROXY_HOST     "192.168.1.100"
@@ -301,6 +322,11 @@ while (1) {
 | | `feishu_set_app_id(id)` | 运行时更新 App ID |
 | | `feishu_set_app_secret(secret)` | 运行时更新 App Secret |
 | | `feishu_set_allow_from(csv)` | 运行时更新允许的发送者列表 |
+| **qqbot** | `qqbot_channel_init()` | 从密钥文件 / NVS 加载 App ID 和 Client Secret |
+| | `qqbot_channel_start()` | 启动 Token 刷新线程 + WebSocket 网关线程 |
+| | `qqbot_send_message(chat_id, text)` | 发送文本；`chat_id` = `c2c:<openid>` 或 `group:<group_openid>` |
+| | `qqbot_set_app_id(id)` | 运行时更新 App ID（持久化到 NVS） |
+| | `qqbot_set_client_secret(secret)` | 运行时更新 Client Secret（持久化到 NVS） |
 | **proxy** | `http_proxy_init()` | 从密钥文件 / NVS 加载代理设置 |
 | | `http_proxy_is_enabled()` | 检查代理是否已配置 |
 | | `http_proxy_set(host, port, type)` | 运行时配置代理 |
