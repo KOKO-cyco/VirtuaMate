@@ -5,7 +5,7 @@
  * @date 2025-03-29
  * @copyright Copyright (c) Tuya Inc.
  */
-#include "text_emotion.h"
+#include "vrm_text_emotion.h"
 
 #include <string.h>
 #include <stdio.h>

@@ -6,7 +6,7 @@
  * @copyright Copyright (c) Tuya Inc.
  */
 
-#include "skybox.h"
+#include "vrm_skybox.h"
 
 #include <stdio.h>
 #include <stdlib.h>

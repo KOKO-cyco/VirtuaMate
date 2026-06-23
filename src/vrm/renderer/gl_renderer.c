@@ -1,19 +1,21 @@
 /**
  * @file gl_renderer.c
- * @brief SDL2 + OpenGL 3.3 core renderer with GPU skinning for VRM models.
- *
- * Supports up to VRM_MAX_BONES bones via a Texture Buffer Object (TBO).
- * Each bone matrix (4x4 float) is stored as 4 texels in an RGBA32F TBO.
+ * @brief VRM renderer submodule (split from gl_renderer.c)
+ * @version 0.1
+ * @date 2025-06-23
+ * @copyright Copyright (c) Tuya Inc. All Rights Reserved.
  */
-
-#include "gl_renderer.h"
+#include "vrm_renderer.h"
+#include "gl_renderer_internal.h"
 #include "vrm_loader.h"
 #include "mat4_util.h"
-#include "emotion/emotion.h"
-#include "spring_bone/spring_bone.h"
-#include "lip_sync.h"
-#include "skybox.h"
-#include "settings_overlay.h"
+#include "vrm_emotion.h"
+#include "vrm_spring_bone.h"
+#include "vrm_lip_sync.h"
+#include "vrm_skybox.h"
+#include "vrm_overlay.h"
+#include "mtoon_shaders.h"
+#include "mtoon_draw.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -28,1149 +30,6 @@
 
 #include "tuya_kconfig.h"
 #include "svc_ai_player.h"
-
-/* ================================================================== */
-/*  Global state — shared with other modules via vrm_viewer_set_speaking */
-/* ================================================================== */
-
-/** Emotion context pointer — valid only while vrm_viewer_run() is executing. */
-static emotion_ctx_t *s_emo_ctx = NULL;
-
-/** Lip sync context — persistent, initialised in vrm_viewer_run(). */
-static lip_sync_ctx_t s_lip_sync_ctx;
-
-/* ------------------------------------------------------------------ */
-/*  Animation switch request (written by any thread, read by render)  */
-/* ------------------------------------------------------------------ */
-
-#define ANIM_NAME_MAX 64
-
-/** Pending animation name.  Empty string = no pending request. */
-static char             s_anim_req_name[ANIM_NAME_MAX];
-/** Set to 1 by vrm_viewer_play_animation(), cleared by the render loop. */
-static volatile int     s_anim_req_pending = 0;
-/** External animation requests should play once, then return to idle_normal. */
-static volatile int     s_anim_req_return_to_idle = 0;
-
-/** Last SDL_GetTicks() when user interaction (MCP request / TTS) occurred.
- *  Written by any thread, read by the render loop. */
-static volatile Uint32  s_last_interact_ticks = 0;
-
-/* ------------------------------------------------------------------ */
-/*  Emotion request (written by any thread, read by render)           */
-/* ------------------------------------------------------------------ */
-
-#define EMO_NAME_MAX 64
-
-static char            s_emo_req_name[EMO_NAME_MAX];
-static float           s_emo_req_intensity = 1.0f;
-static float           s_emo_req_speed     = 0.0f;
-static volatile int    s_emo_req_pending   = 0;
-
-/* ------------------------------------------------------------------ */
-/*  BlendShape override request (written by any thread, read by render) */
-/* ------------------------------------------------------------------ */
-
-#define BS_REQ_MAX 16
-
-typedef struct {
-    char  name[64];
-    float weight;
-} bs_req_entry_t;
-
-static bs_req_entry_t  s_bs_req_entries[BS_REQ_MAX];
-static int             s_bs_req_count   = 0;
-static volatile int    s_bs_req_pending = 0;
-static volatile int    s_bs_clear_pending = 0;
-
-/* ------------------------------------------------------------------ */
-/*  Model / scene reload request (written by settings UI)             */
-/* ------------------------------------------------------------------ */
-
-#define RELOAD_PATH_MAX 1024
-
-static char         s_reload_model_path[RELOAD_PATH_MAX];
-static volatile int s_reload_model_pending = 0;
-
-static char         s_reload_scene_dir[RELOAD_PATH_MAX];
-static volatile int s_reload_scene_pending = 0;
-
-/* (Subtitle display is now handled by the LVGL settings panel) */
-
-/* ================================================================== */
-/*  Chained audio consumer — forwards PCM to speaker + lip sync      */
-/* ================================================================== */
-
-/* Forward-declare the default speaker consumer defined in consumer_speaker.c */
-extern AI_PLAYER_CONSUMER_T g_consumer_speaker;
-
-/** Handle obtained from the underlying speaker consumer's open() call. */
-static PLAYER_CONSUMER_HANDLE s_speaker_handle = NULL;
-
-static OPERATE_RET __lc_open(PLAYER_CONSUMER_HANDLE *handle)
-{
-    OPERATE_RET rt = g_consumer_speaker.open(&s_speaker_handle);
-    *handle = (PLAYER_CONSUMER_HANDLE)&s_lip_sync_ctx;
-    return rt;
-}
-
-static OPERATE_RET __lc_close(PLAYER_CONSUMER_HANDLE handle)
-{
-    (void)handle;
-    vrm_viewer_set_speaking(0);
-    return g_consumer_speaker.close(s_speaker_handle);
-}
-
-static OPERATE_RET __lc_start(PLAYER_CONSUMER_HANDLE handle)
-{
-    (void)handle;
-    vrm_viewer_set_speaking(1);
-    return g_consumer_speaker.start(s_speaker_handle);
-}
-
-static OPERATE_RET __lc_write(PLAYER_CONSUMER_HANDLE handle,
-                               const void *buf, uint32_t len)
-{
-    (void)handle;
-    /* Feed decoded PCM to lip sync analysis (16 kHz, 16-bit, mono) */
-    lip_sync_feed_pcm(&s_lip_sync_ctx, buf, len, 1, 16);
-    /* Forward to hardware speaker */
-    return g_consumer_speaker.write(s_speaker_handle, buf, len);
-}
-
-static OPERATE_RET __lc_stop(PLAYER_CONSUMER_HANDLE handle)
-{
-    (void)handle;
-    vrm_viewer_set_speaking(0);
-    return g_consumer_speaker.stop(s_speaker_handle);
-}
-
-static OPERATE_RET __lc_set_volume(PLAYER_CONSUMER_HANDLE handle,
-                                    uint32_t volume)
-{
-    (void)handle;
-    return g_consumer_speaker.set_volume(s_speaker_handle, volume);
-}
-
-static AI_PLAYER_CONSUMER_T s_lip_sync_consumer = {
-    .open       = __lc_open,
-    .close      = __lc_close,
-    .start      = __lc_start,
-    .write      = __lc_write,
-    .stop       = __lc_stop,
-    .set_volume = __lc_set_volume,
-};
-
-/* ================================================================== */
-/*  Idle behavior — configuration                                      */
-/* ================================================================== */
-
-typedef struct {
-    const char *name;   /**< Animation name (VRMA filename without extension) */
-    int         weight; /**< Relative weight for random selection */
-} idle_anim_entry_t;
-
-static const idle_anim_entry_t s_idle_pool[] = {
-    { "idle_normal",        10 },
-    { "idle_boring",         3 },
-    { "happy_idle",          3 },
-    { "thinking",            2 },
-    { "squat",               1 },
-    { "show",                1 },
-};
-#define IDLE_POOL_COUNT  (int)(sizeof(s_idle_pool) / sizeof(s_idle_pool[0]))
-
-static const char *s_oneshot_anims[] = {
-    "say_hello", "standing_greeting", "wave",
-    "excited", "joy", "crying",
-    "show", "squat", "shoot", "bier",
-    "look_around", "thinking",
-    NULL
-};
-
-static const emotion_id_t s_idle_emotions[] = {
-    EMOTION_NEUTRAL, EMOTION_NEUTRAL, EMOTION_NEUTRAL,
-    EMOTION_HAPPY, EMOTION_HAPPY,
-    EMOTION_WINK,
-    EMOTION_THINKING, EMOTION_THINKING,
-    EMOTION_COOL,
-    EMOTION_RELAXED, EMOTION_RELAXED,
-    EMOTION_SILLY,
-    EMOTION_CONFUSED,
-    EMOTION_LOVING,
-};
-#define IDLE_EMOTION_COUNT  (int)(sizeof(s_idle_emotions) / sizeof(s_idle_emotions[0]))
-
-#define IDLE_SWITCH_MIN_SEC    8.0f
-#define IDLE_SWITCH_MAX_SEC   18.0f
-#define IDLE_EMOTION_MIN_SEC   8.0f
-#define IDLE_EMOTION_MAX_SEC  16.0f
-#define IDLE_EMOTION_HOLD_SEC  3.0f
-#define IDLE_INTERACT_COOLDOWN 5.0f
-#define ANIM_SWITCH_BLEND_SEC  0.60f
-
-/* ================================================================== */
-/*  Public: speaking control (called from any thread)                 */
-/* ================================================================== */
-
-/**
- * Grace period (ms) after TTS_STOP before lip sync is actually disabled.
- * Allows the speaker's audio buffer to drain so the last sentence still
- * has visible lip movement.
- */
-#define SPEAKING_FADE_MS 500
-
-static volatile Uint32 s_speaking_stop_ticks   = 0;
-static volatile int    s_speaking_stop_pending  = 0;
-
-void vrm_viewer_set_speaking(int speaking)
-{
-    s_last_interact_ticks = SDL_GetTicks();
-    emotion_ctx_t *ctx = s_emo_ctx;
-    if (!ctx) return;
-
-    if (speaking) {
-        s_speaking_stop_pending = 0;
-        emotion_set_speaking(ctx, 1);
-    } else {
-        s_speaking_stop_ticks  = SDL_GetTicks();
-        s_speaking_stop_pending = 1;
-    }
-}
-
-void vrm_viewer_play_animation(const char *name)
-{
-    if (!name || name[0] == '\0') return;
-    s_last_interact_ticks = SDL_GetTicks();
-    strncpy(s_anim_req_name, name, ANIM_NAME_MAX - 1);
-    s_anim_req_name[ANIM_NAME_MAX - 1] = '\0';
-    s_anim_req_return_to_idle = 1;
-    s_anim_req_pending = 1;
-}
-
-void vrm_viewer_set_emotion(const char *name, float intensity, float speed)
-{
-    if (!name || name[0] == '\0') return;
-    s_last_interact_ticks = SDL_GetTicks();
-    strncpy(s_emo_req_name, name, EMO_NAME_MAX - 1);
-    s_emo_req_name[EMO_NAME_MAX - 1] = '\0';
-    s_emo_req_intensity = intensity;
-    s_emo_req_speed     = speed;
-    s_emo_req_pending   = 1;
-}
-
-void vrm_viewer_set_blendshape(const char *expr_name, float weight)
-{
-    if (!expr_name || expr_name[0] == '\0') return;
-    s_last_interact_ticks = SDL_GetTicks();
-    int idx = s_bs_req_count;
-    if (idx >= BS_REQ_MAX) return;
-    strncpy(s_bs_req_entries[idx].name, expr_name, 63);
-    s_bs_req_entries[idx].name[63] = '\0';
-    s_bs_req_entries[idx].weight   = weight;
-    s_bs_req_count = idx + 1;
-    s_bs_req_pending = 1;
-}
-
-void vrm_viewer_clear_blendshapes(void)
-{
-    s_last_interact_ticks = SDL_GetTicks();
-    s_bs_clear_pending = 1;
-}
-
-void vrm_viewer_set_subtitle(const char *text)
-{
-    settings_overlay_set_subtitle(text);
-}
-
-void vrm_viewer_reload_model(const char *model_path)
-{
-    if (!model_path || model_path[0] == '\0') {
-        return;
-    }
-    strncpy(s_reload_model_path, model_path, RELOAD_PATH_MAX - 1);
-    s_reload_model_path[RELOAD_PATH_MAX - 1] = '\0';
-    s_reload_model_pending = 1;
-}
-
-void vrm_viewer_reload_scene(const char *scene_dir)
-{
-    if (!scene_dir) {
-        s_reload_scene_dir[0] = '\0';
-    } else {
-        strncpy(s_reload_scene_dir, scene_dir, RELOAD_PATH_MAX - 1);
-        s_reload_scene_dir[RELOAD_PATH_MAX - 1] = '\0';
-    }
-    s_reload_scene_pending = 1;
-}
-
-#ifdef VRM_WINDOW_WIDTH
-#define INIT_WIDTH  VRM_WINDOW_WIDTH
-#else
-#define INIT_WIDTH  1024
-#endif
-
-#ifdef VRM_WINDOW_HEIGHT
-#define INIT_HEIGHT VRM_WINDOW_HEIGHT
-#else
-#define INIT_HEIGHT 768
-#endif
-
-/* ================================================================== */
-/*  Shader sources                                                     */
-/* ================================================================== */
-
-static const char *s_model_vs =
-    "#version 140\n"
-    "#extension GL_ARB_explicit_attrib_location : enable\n"
-    "layout(location=0) in vec3 a_pos;\n"
-    "layout(location=1) in vec3 a_normal;\n"
-    "layout(location=2) in vec2 a_uv;\n"
-    "layout(location=3) in vec4 a_bone_ids;\n"
-    "layout(location=4) in vec4 a_bone_weights;\n"
-    "\n"
-    "uniform mat4 u_mvp;\n"
-    "uniform mat4 u_model;\n"
-    "uniform int  u_skinned;\n"
-    "uniform samplerBuffer u_bone_tbo;\n"
-    "\n"
-    "out vec2 v_uv;\n"
-    "out vec3 v_normal;\n"
-    "\n"
-    "mat4 getBoneMatrix(int idx) {\n"
-    "    int base = idx * 4;\n"
-    "    return mat4(\n"
-    "        texelFetch(u_bone_tbo, base + 0),\n"
-    "        texelFetch(u_bone_tbo, base + 1),\n"
-    "        texelFetch(u_bone_tbo, base + 2),\n"
-    "        texelFetch(u_bone_tbo, base + 3)\n"
-    "    );\n"
-    "}\n"
-    "\n"
-    "void main() {\n"
-    "    vec4 pos = vec4(a_pos, 1.0);\n"
-    "    vec4 norm4 = vec4(a_normal, 0.0);\n"
-    "\n"
-    "    if (u_skinned != 0) {\n"
-    "        mat4 skin = mat4(0.0);\n"
-    "        ivec4 ids = ivec4(a_bone_ids);\n"
-    "        skin += a_bone_weights.x * getBoneMatrix(ids.x);\n"
-    "        skin += a_bone_weights.y * getBoneMatrix(ids.y);\n"
-    "        skin += a_bone_weights.z * getBoneMatrix(ids.z);\n"
-    "        skin += a_bone_weights.w * getBoneMatrix(ids.w);\n"
-    "        pos  = skin * pos;\n"
-    "        norm4 = skin * norm4;\n"
-    "    }\n"
-    "\n"
-    "    gl_Position = u_mvp * pos;\n"
-    "    v_uv        = a_uv;\n"
-    "    v_normal    = normalize(mat3(u_model) * norm4.xyz);\n"
-    "}\n";
-
-static const char *s_model_fs =
-    "#version 140\n"
-    "in vec2 v_uv;\n"
-    "in vec3 v_normal;\n"
-    "out vec4 frag_color;\n"
-    "uniform vec4      u_base_color;\n"
-    "uniform sampler2D u_texture;\n"
-    "uniform int       u_has_texture;\n"
-    "uniform vec3      u_light_dir;\n"
-    "void main() {\n"
-    "    vec4 base;\n"
-    "    if (u_has_texture != 0) {\n"
-    "        base = texture(u_texture, v_uv) * u_base_color;\n"
-    "    } else {\n"
-    "        base = u_base_color;\n"
-    "    }\n"
-    "    if (base.a < 0.1) discard;\n"
-    "\n"
-    "    vec3 n = normalize(v_normal);\n"
-    "    float NdotL = dot(n, u_light_dir);\n"
-    "    float lit = smoothstep(-0.02, 0.05, NdotL - 0.1);\n"
-    "    vec3 shadow = base.rgb * vec3(0.62, 0.58, 0.72);\n"
-    "    frag_color = vec4(mix(shadow, base.rgb, lit), base.a);\n"
-    "}\n";
-
-/* ---- grid shader ---- */
-static const char *s_grid_vs =
-    "#version 140\n"
-    "#extension GL_ARB_explicit_attrib_location : enable\n"
-    "layout(location=0) in vec3 a_pos;\n"
-    "uniform mat4 u_mvp;\n"
-    "out vec3 v_pos;\n"
-    "void main() {\n"
-    "    gl_Position = u_mvp * vec4(a_pos, 1.0);\n"
-    "    v_pos = a_pos;\n"
-    "}\n";
-
-static const char *s_grid_fs =
-    "#version 140\n"
-    "in vec3 v_pos;\n"
-    "out vec4 frag_color;\n"
-    "void main() {\n"
-    "    float dist  = length(v_pos.xz) / 16.0;\n"
-    "    float alpha = clamp(1.0 - dist * 0.7, 0.0, 1.0);\n"
-    "    frag_color  = vec4(0.35, 0.40, 0.55, alpha * 0.35);\n"
-    "}\n";
-
-/* ---- background gradient shader ---- */
-static const char *s_bg_vs =
-    "#version 140\n"
-    "#extension GL_ARB_explicit_attrib_location : enable\n"
-    "layout(location=0) in vec2 a_pos;\n"
-    "out vec2 v_uv;\n"
-    "void main() {\n"
-    "    gl_Position = vec4(a_pos, 0.999, 1.0);\n"
-    "    v_uv = a_pos * 0.5 + 0.5;\n"
-    "}\n";
-
-static const char *s_bg_fs =
-    "#version 140\n"
-    "in vec2 v_uv;\n"
-    "out vec4 frag_color;\n"
-    "void main() {\n"
-    "    vec3 col_bot = vec3(0.08, 0.08, 0.14);\n"
-    "    vec3 col_top = vec3(0.12, 0.13, 0.22);\n"
-    "    vec3 bg = mix(col_bot, col_top, v_uv.y);\n"
-    "    frag_color = vec4(bg, 1.0);\n"
-    "}\n";
-
-/* ---- shadow depth shader (renders model from light's view) ---- */
-static const char *s_shadow_vs =
-    "#version 140\n"
-    "#extension GL_ARB_explicit_attrib_location : enable\n"
-    "layout(location=0) in vec3 a_pos;\n"
-    "layout(location=3) in vec4 a_bone_ids;\n"
-    "layout(location=4) in vec4 a_bone_weights;\n"
-    "uniform mat4 u_light_mvp;\n"
-    "uniform int  u_skinned;\n"
-    "uniform samplerBuffer u_bone_tbo;\n"
-    "mat4 getBoneMatrix(int idx) {\n"
-    "    int base = idx * 4;\n"
-    "    return mat4(\n"
-    "        texelFetch(u_bone_tbo, base + 0),\n"
-    "        texelFetch(u_bone_tbo, base + 1),\n"
-    "        texelFetch(u_bone_tbo, base + 2),\n"
-    "        texelFetch(u_bone_tbo, base + 3)\n"
-    "    );\n"
-    "}\n"
-    "void main() {\n"
-    "    vec4 pos = vec4(a_pos, 1.0);\n"
-    "    if (u_skinned != 0) {\n"
-    "        mat4 skin = mat4(0.0);\n"
-    "        ivec4 ids = ivec4(a_bone_ids);\n"
-    "        skin += a_bone_weights.x * getBoneMatrix(ids.x);\n"
-    "        skin += a_bone_weights.y * getBoneMatrix(ids.y);\n"
-    "        skin += a_bone_weights.z * getBoneMatrix(ids.z);\n"
-    "        skin += a_bone_weights.w * getBoneMatrix(ids.w);\n"
-    "        pos = skin * pos;\n"
-    "    }\n"
-    "    gl_Position = u_light_mvp * pos;\n"
-    "}\n";
-
-static const char *s_shadow_fs =
-    "#version 140\n"
-    "void main() {}\n";
-
-/* ---- ground shadow receiver shader ---- */
-static const char *s_ground_shadow_vs =
-    "#version 140\n"
-    "#extension GL_ARB_explicit_attrib_location : enable\n"
-    "layout(location=0) in vec3 a_pos;\n"
-    "uniform mat4 u_mvp;\n"
-    "uniform mat4 u_light_vp;\n"
-    "uniform mat4 u_ground_mat;\n"
-    "out vec4 v_light_pos;\n"
-    "out vec3 v_world;\n"
-    "void main() {\n"
-    "    vec4 world = u_ground_mat * vec4(a_pos, 1.0);\n"
-    "    gl_Position = u_mvp * vec4(a_pos, 1.0);\n"
-    "    v_light_pos = u_light_vp * world;\n"
-    "    v_world = world.xyz;\n"
-    "}\n";
-
-static const char *s_ground_shadow_fs =
-    "#version 140\n"
-    "in vec4 v_light_pos;\n"
-    "in vec3 v_world;\n"
-    "out vec4 frag_color;\n"
-    "uniform sampler2D u_shadow_map;\n"
-    "uniform vec3 u_center;\n"
-    "uniform float u_radius;\n"
-    "void main() {\n"
-    "    vec3 proj = v_light_pos.xyz / v_light_pos.w;\n"
-    "    proj = proj * 0.5 + 0.5;\n"
-    "    if (proj.x < 0.0 || proj.x > 1.0 ||\n"
-    "        proj.y < 0.0 || proj.y > 1.0 ||\n"
-    "        proj.z > 1.0) discard;\n"
-    "    float shadow = 0.0;\n"
-    "    vec2 texel = 1.0 / vec2(textureSize(u_shadow_map, 0));\n"
-    "    float bias = 0.003;\n"
-    "    for (int x = -2; x <= 2; x++) {\n"
-    "        for (int y = -2; y <= 2; y++) {\n"
-    "            float d = texture(u_shadow_map, proj.xy + vec2(x,y)*texel).r;\n"
-    "            shadow += (proj.z - bias > d) ? 1.0 : 0.0;\n"
-    "        }\n"
-    "    }\n"
-    "    shadow /= 25.0;\n"
-    "    if (shadow < 0.01) discard;\n"
-    "    float dist = length(v_world.xz - u_center.xz) / u_radius;\n"
-    "    float fade = smoothstep(1.0, 0.2, dist);\n"
-    "    frag_color = vec4(0.0, 0.0, 0.05, shadow * 0.45 * fade);\n"
-    "}\n";
-
-/* ---- inverted-hull outline shader ---- */
-static const char *s_outline_vs =
-    "#version 140\n"
-    "#extension GL_ARB_explicit_attrib_location : enable\n"
-    "layout(location=0) in vec3 a_pos;\n"
-    "layout(location=1) in vec3 a_normal;\n"
-    "layout(location=3) in vec4 a_bone_ids;\n"
-    "layout(location=4) in vec4 a_bone_weights;\n"
-    "\n"
-    "uniform mat4 u_mvp;\n"
-    "uniform int  u_skinned;\n"
-    "uniform float u_outline_width;\n"
-    "uniform samplerBuffer u_bone_tbo;\n"
-    "\n"
-    "mat4 getBoneMatrix(int idx) {\n"
-    "    int base = idx * 4;\n"
-    "    return mat4(\n"
-    "        texelFetch(u_bone_tbo, base + 0),\n"
-    "        texelFetch(u_bone_tbo, base + 1),\n"
-    "        texelFetch(u_bone_tbo, base + 2),\n"
-    "        texelFetch(u_bone_tbo, base + 3)\n"
-    "    );\n"
-    "}\n"
-    "\n"
-    "void main() {\n"
-    "    vec4 pos = vec4(a_pos, 1.0);\n"
-    "    vec4 norm4 = vec4(a_normal, 0.0);\n"
-    "\n"
-    "    if (u_skinned != 0) {\n"
-    "        mat4 skin = mat4(0.0);\n"
-    "        ivec4 ids = ivec4(a_bone_ids);\n"
-    "        skin += a_bone_weights.x * getBoneMatrix(ids.x);\n"
-    "        skin += a_bone_weights.y * getBoneMatrix(ids.y);\n"
-    "        skin += a_bone_weights.z * getBoneMatrix(ids.z);\n"
-    "        skin += a_bone_weights.w * getBoneMatrix(ids.w);\n"
-    "        pos  = skin * pos;\n"
-    "        norm4 = skin * norm4;\n"
-    "    }\n"
-    "\n"
-    "    vec4 clip = u_mvp * pos;\n"
-    "    vec3 cn = mat3(u_mvp) * normalize(norm4.xyz);\n"
-    "    vec2 d = normalize(cn.xy) * u_outline_width * clip.w;\n"
-    "    clip.xy += d;\n"
-    "    gl_Position = clip;\n"
-    "}\n";
-
-static const char *s_outline_fs =
-    "#version 140\n"
-    "out vec4 frag_color;\n"
-    "uniform vec4 u_outline_color;\n"
-    "void main() {\n"
-    "    frag_color = u_outline_color;\n"
-    "}\n";
-
-/* ================================================================== */
-/*  GL helpers                                                         */
-/* ================================================================== */
-
-typedef struct {
-    GLuint   vao;
-    GLuint   vbo;
-    GLuint   ebo;
-    GLuint   tex_id;
-    uint32_t index_count;
-    uint32_t vertex_count;
-    float    color[4];
-    int      has_texture;
-    int      has_bones;
-    int      has_morph;
-} gpu_mesh_t;
-
-static GLuint __compile_shader(GLenum type, const char *src)
-{
-    GLuint s = glCreateShader(type);
-    glShaderSource(s, 1, &src, NULL);
-    glCompileShader(s);
-    int ok;
-    glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
-    if (!ok) {
-        char log[1024];
-        glGetShaderInfoLog(s, sizeof(log), NULL, log);
-        fprintf(stderr, "[gl] shader compile error:\n%s\n", log);
-    }
-    return s;
-}
-
-static GLuint __link_program(const char *vs_src, const char *fs_src)
-{
-    GLuint vs = __compile_shader(GL_VERTEX_SHADER, vs_src);
-    GLuint fs = __compile_shader(GL_FRAGMENT_SHADER, fs_src);
-    GLuint prog = glCreateProgram();
-    glAttachShader(prog, vs);
-    glAttachShader(prog, fs);
-    glLinkProgram(prog);
-
-    int ok;
-    glGetProgramiv(prog, GL_LINK_STATUS, &ok);
-    if (!ok) {
-        char log[1024];
-        glGetProgramInfoLog(prog, sizeof(log), NULL, log);
-        fprintf(stderr, "[gl] program link error:\n%s\n", log);
-    }
-    glDeleteShader(vs);
-    glDeleteShader(fs);
-    return prog;
-}
-
-static void __upload_mesh(gpu_mesh_t *gpu, const vrm_mesh_t *mesh,
-                          const vrm_model_t *model)
-{
-    glGenVertexArrays(1, &gpu->vao);
-    glGenBuffers(1, &gpu->vbo);
-    glGenBuffers(1, &gpu->ebo);
-
-    glBindVertexArray(gpu->vao);
-
-    /* Vertex layout: pos(3)+normal(3)+uv(2)+boneId(4)+boneWt(4) = 16 floats */
-    const GLsizei stride = 16 * (GLsizei)sizeof(float);
-
-    glBindBuffer(GL_ARRAY_BUFFER, gpu->vbo);
-    glBufferData(GL_ARRAY_BUFFER,
-                 (GLsizeiptr)(mesh->vertex_count * 16 * sizeof(float)),
-                 mesh->vertices,
-                 mesh->morph_target_count > 0 ? GL_DYNAMIC_DRAW : GL_STATIC_DRAW);
-
-    /* location 0 = position (3) */
-    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, stride, (void *)0);
-    glEnableVertexAttribArray(0);
-
-    /* location 1 = normal (3) */
-    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, stride,
-                          (void *)(3 * sizeof(float)));
-    glEnableVertexAttribArray(1);
-
-    /* location 2 = uv (2) */
-    glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, stride,
-                          (void *)(6 * sizeof(float)));
-    glEnableVertexAttribArray(2);
-
-    /* location 3 = bone IDs (4 floats, will be cast to int in shader) */
-    glVertexAttribPointer(3, 4, GL_FLOAT, GL_FALSE, stride,
-                          (void *)(8 * sizeof(float)));
-    glEnableVertexAttribArray(3);
-
-    /* location 4 = bone weights (4) */
-    glVertexAttribPointer(4, 4, GL_FLOAT, GL_FALSE, stride,
-                          (void *)(12 * sizeof(float)));
-    glEnableVertexAttribArray(4);
-
-    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, gpu->ebo);
-    glBufferData(GL_ELEMENT_ARRAY_BUFFER,
-                 (GLsizeiptr)(mesh->index_count * sizeof(uint32_t)),
-                 mesh->indices, GL_STATIC_DRAW);
-
-    gpu->index_count = mesh->index_count;
-    gpu->vertex_count = mesh->vertex_count;
-    memcpy(gpu->color, mesh->color, sizeof(float) * 4);
-    gpu->has_bones = mesh->has_bones;
-    gpu->has_morph = (mesh->morph_target_count > 0) ? 1 : 0;
-
-    /* ---- Upload texture if available ---- */
-    gpu->tex_id = 0;
-    gpu->has_texture = 0;
-
-    if (mesh->texture_index >= 0 &&
-        (uint32_t)mesh->texture_index < model->texture_count) {
-        const vrm_texture_t *tex = &model->textures[mesh->texture_index];
-        if (tex->pixels && tex->width > 0 && tex->height > 0) {
-            glGenTextures(1, &gpu->tex_id);
-            glBindTexture(GL_TEXTURE_2D, gpu->tex_id);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA,
-                         tex->width, tex->height, 0,
-                         GL_RGBA, GL_UNSIGNED_BYTE, tex->pixels);
-            glGenerateMipmap(GL_TEXTURE_2D);
-            gpu->has_texture = 1;
-            glBindTexture(GL_TEXTURE_2D, 0);
-        }
-    }
-
-    glBindVertexArray(0);
-}
-
-/* ---- ground grid ---- */
-static GLuint s_grid_vao, s_grid_vbo;
-static int    s_grid_vert_count;
-static GLuint s_bg_vao, s_bg_vbo;
-
-/* ---- shadow map ---- */
-#define SHADOW_MAP_SIZE 2048
-static GLuint s_shadow_fbo, s_shadow_depth_tex;
-static GLuint s_ground_vao, s_ground_vbo, s_ground_ebo;
-
-static void __create_grid(void)
-{
-    enum { DIVS = 40, MAX_VERTS = (DIVS + 1) * 4 };
-    float buf[MAX_VERTS * 3];
-    int n = 0;
-    float half = 10.0f;
-    float step = (half * 2.0f) / DIVS;
-
-    for (int i = 0; i <= DIVS; i++) {
-        float t = -half + i * step;
-        buf[n++] = -half; buf[n++] = 0.0f; buf[n++] = t;
-        buf[n++] =  half; buf[n++] = 0.0f; buf[n++] = t;
-        buf[n++] = t; buf[n++] = 0.0f; buf[n++] = -half;
-        buf[n++] = t; buf[n++] = 0.0f; buf[n++] =  half;
-    }
-    s_grid_vert_count = n / 3;
-
-    glGenVertexArrays(1, &s_grid_vao);
-    glGenBuffers(1, &s_grid_vbo);
-    glBindVertexArray(s_grid_vao);
-    glBindBuffer(GL_ARRAY_BUFFER, s_grid_vbo);
-    glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(n * sizeof(float)), buf, GL_STATIC_DRAW);
-    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * (GLsizei)sizeof(float), (void *)0);
-    glEnableVertexAttribArray(0);
-    glBindVertexArray(0);
-}
-
-static void __create_bg_quad(void)
-{
-    float verts[] = { -1,-1, 1,-1, -1,1, 1,1 };
-    glGenVertexArrays(1, &s_bg_vao);
-    glGenBuffers(1, &s_bg_vbo);
-    glBindVertexArray(s_bg_vao);
-    glBindBuffer(GL_ARRAY_BUFFER, s_bg_vbo);
-    glBufferData(GL_ARRAY_BUFFER, sizeof(verts), verts, GL_STATIC_DRAW);
-    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 2 * sizeof(float), (void *)0);
-    glEnableVertexAttribArray(0);
-    glBindVertexArray(0);
-}
-
-/**
- * @brief Create the shadow map FBO with a depth-only texture
- * @return none
- */
-static void __create_shadow_fbo(void)
-{
-    glGenTextures(1, &s_shadow_depth_tex);
-    glBindTexture(GL_TEXTURE_2D, s_shadow_depth_tex);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT24,
-                 SHADOW_MAP_SIZE, SHADOW_MAP_SIZE, 0,
-                 GL_DEPTH_COMPONENT, GL_FLOAT, NULL);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_BORDER);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_BORDER);
-    float border[] = { 1.0f, 1.0f, 1.0f, 1.0f };
-    glTexParameterfv(GL_TEXTURE_2D, GL_TEXTURE_BORDER_COLOR, border);
-    glBindTexture(GL_TEXTURE_2D, 0);
-
-    glGenFramebuffers(1, &s_shadow_fbo);
-    glBindFramebuffer(GL_FRAMEBUFFER, s_shadow_fbo);
-    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT,
-                           GL_TEXTURE_2D, s_shadow_depth_tex, 0);
-    glDrawBuffer(GL_NONE);
-    glReadBuffer(GL_NONE);
-    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
-        fprintf(stderr, "[gl] shadow FBO incomplete!\n");
-    }
-    glBindFramebuffer(GL_FRAMEBUFFER, 0);
-}
-
-/**
- * @brief Create a unit XZ quad (Y=0, from -1..1) for ground shadow receiving
- * @return none
- */
-static void __create_ground_quad(void)
-{
-    float verts[] = {
-        -1.0f, 0.0f, -1.0f,
-         1.0f, 0.0f, -1.0f,
-         1.0f, 0.0f,  1.0f,
-        -1.0f, 0.0f,  1.0f,
-    };
-    uint32_t indices[] = { 0, 1, 2, 0, 2, 3 };
-
-    glGenVertexArrays(1, &s_ground_vao);
-    glGenBuffers(1, &s_ground_vbo);
-    glGenBuffers(1, &s_ground_ebo);
-    glBindVertexArray(s_ground_vao);
-
-    glBindBuffer(GL_ARRAY_BUFFER, s_ground_vbo);
-    glBufferData(GL_ARRAY_BUFFER, sizeof(verts), verts, GL_STATIC_DRAW);
-    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * (GLsizei)sizeof(float), (void *)0);
-    glEnableVertexAttribArray(0);
-
-    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, s_ground_ebo);
-    glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof(indices), indices, GL_STATIC_DRAW);
-
-    glBindVertexArray(0);
-}
-
-/* ================================================================== */
-/*  Public entry point                                                 */
-/* ================================================================== */
-
-/* Compare function for qsort of filename strings */
-static int __cmp_str(const void *a, const void *b)
-{
-    return strcmp(*(const char **)a, *(const char **)b);
-}
-
-/* ================================================================== */
-/*  Idle behavior — helpers                                            */
-/* ================================================================== */
-
-/**
- * @brief Check if an animation name is one-shot (play once then return to idle)
- * @param[in] name animation name
- * @return 1 if one-shot, 0 if looping
- */
-static int __is_oneshot(const char *name)
-{
-    for (int i = 0; s_oneshot_anims[i]; i++) {
-        if (strcmp(name, s_oneshot_anims[i]) == 0) {
-            return 1;
-        }
-    }
-    return 0;
-}
-
-static int __find_anim_idx(char **anim_names, int anim_name_count, const char *name)
-{
-    if (!anim_names || anim_name_count <= 0 || !name || name[0] == '\0') {
-        return -1;
-    }
-
-    for (int i = 0; i < anim_name_count; i++) {
-        if (strcmp(anim_names[i], name) == 0) {
-            return i;
-        }
-    }
-
-    return -1;
-}
-
-/**
- * @brief Generate a random float in [lo, hi]
- * @param[in] lo lower bound
- * @param[in] hi upper bound
- * @return random value
- */
-static float __rand_range_f(float lo, float hi)
-{
-    return lo + (float)rand() / (float)RAND_MAX * (hi - lo);
-}
-
-/**
- * @brief Generate a random interval in milliseconds from a [min, max] seconds range
- * @param[in] min_sec minimum seconds
- * @param[in] max_sec maximum seconds
- * @return interval in milliseconds
- */
-static Uint32 __rand_interval_ms(float min_sec, float max_sec)
-{
-    return (Uint32)(__rand_range_f(min_sec, max_sec) * 1000.0f);
-}
-
-/**
- * @brief Detect Y-rotation needed so the model faces the camera (+Z).
- *
- * Uses the humanoid bone map to find "leftUpperArm" and "rightUpperArm"
- * rest-pose world positions. In a correctly oriented model (facing +Z
- * toward the camera at +Z), leftUpperArm.x should be greater than
- * rightUpperArm.x in world space.  If reversed, the model faces -Z
- * and needs a 180-degree Y rotation.
- *
- * @param[in] model loaded VRM model with humanoid_map populated
- * @return rotation angle in radians (0 or M_PI)
- */
-static float __detect_model_facing(const vrm_model_t *model)
-{
-    if (!model->humanoid_map || model->humanoid_map_count == 0 ||
-        !model->bones || model->bone_count == 0) {
-        return 0.0f;
-    }
-
-    int left_bone  = -1;
-    int right_bone = -1;
-
-    for (uint32_t i = 0; i < model->humanoid_map_count; i++) {
-        const char *hname = model->humanoid_map[i].humanoid_name;
-        const char *nname = model->humanoid_map[i].node_name;
-        if (!nname[0]) continue;
-
-        int bone_idx = -1;
-        for (uint32_t b = 0; b < model->bone_count; b++) {
-            if (strcmp(model->bones[b].name, nname) == 0) {
-                bone_idx = (int)b;
-                break;
-            }
-        }
-        if (bone_idx < 0) continue;
-
-        if (strcmp(hname, "leftUpperArm") == 0)  left_bone  = bone_idx;
-        if (strcmp(hname, "rightUpperArm") == 0) right_bone = bone_idx;
-    }
-
-    if (left_bone < 0 || right_bone < 0) {
-        printf("[vrm] facing detect: missing arm bones, assuming front-facing\n");
-        return 0.0f;
-    }
-
-    /* Compute rest-pose global transforms */
-    uint32_t nb = model->bone_count;
-    float *globals = (float *)malloc(nb * 16 * sizeof(float));
-    if (!globals) return 0.0f;
-
-    for (uint32_t i = 0; i < nb; i++) {
-        if (model->bones[i].parent < 0) {
-            memcpy(&globals[i * 16], model->bones[i].local_transform, 16 * sizeof(float));
-        } else {
-            int p = model->bones[i].parent;
-            mat4_multiply(&globals[i * 16], &globals[p * 16],
-                          model->bones[i].local_transform);
-        }
-    }
-
-    /* World X of each arm = column 3 (translation), element [12] of the 4x4 */
-    float lx = globals[left_bone  * 16 + 12];
-    float rx = globals[right_bone * 16 + 12];
-
-    free(globals);
-
-    /*
-     * Camera is at +Z looking in -Z.
-     * Model facing +Z (toward camera): leftArm.x > rightArm.x  → OK
-     * Model facing -Z (away):          leftArm.x < rightArm.x  → rotate 180°
-     */
-    if (lx < rx) {
-        printf("[vrm] facing detect: model faces -Z (lx=%.3f rx=%.3f), rotating 180°\n",
-               lx, rx);
-        return (float)M_PI;
-    }
-
-    printf("[vrm] facing detect: model faces +Z (lx=%.3f rx=%.3f), no rotation\n",
-           lx, rx);
-    return 0.0f;
-}
-
-/**
- * @brief Weighted random selection of an idle animation from loaded pool
- * @param[in] anim_names loaded animation names array
- * @param[in] anim_name_count number of loaded animations
- * @param[in] last_pick index to skip for variety (-1 = no skip)
- * @return index into anim_names, or -1 if none available
- */
-static int __pick_idle_anim(char **anim_names, int anim_name_count, int last_pick)
-{
-    int avail[IDLE_POOL_COUNT];
-    int avail_weights[IDLE_POOL_COUNT];
-    int avail_count  = 0;
-    int total_weight = 0;
-
-    for (int p = 0; p < IDLE_POOL_COUNT; p++) {
-        for (int a = 0; a < anim_name_count; a++) {
-            if (strcmp(anim_names[a], s_idle_pool[p].name) == 0) {
-                if (a == last_pick) {
-                    break;
-                }
-                avail[avail_count]        = a;
-                avail_weights[avail_count] = s_idle_pool[p].weight;
-                total_weight += s_idle_pool[p].weight;
-                avail_count++;
-                break;
-            }
-        }
-    }
-
-    /* Fallback: allow last_pick if it was the only available entry */
-    if (avail_count == 0) {
-        for (int p = 0; p < IDLE_POOL_COUNT; p++) {
-            for (int a = 0; a < anim_name_count; a++) {
-                if (strcmp(anim_names[a], s_idle_pool[p].name) == 0) {
-                    avail[avail_count]        = a;
-                    avail_weights[avail_count] = s_idle_pool[p].weight;
-                    total_weight += s_idle_pool[p].weight;
-                    avail_count++;
-                    break;
-                }
-            }
-        }
-    }
-
-    if (avail_count == 0 || total_weight == 0) {
-        return -1;
-    }
-
-    int roll = rand() % total_weight;
-    int sum  = 0;
-    for (int i = 0; i < avail_count; i++) {
-        sum += avail_weights[i];
-        if (roll < sum) {
-            return avail[i];
-        }
-    }
-    return avail[avail_count - 1];
-}
-
-static int __pick_recovery_idle_anim(char **anim_names, int anim_name_count, int last_pick)
-{
-    int idx = __find_anim_idx(anim_names, anim_name_count, "idle_normal");
-    if (idx >= 0) {
-        return idx;
-    }
-
-    return __pick_idle_anim(anim_names, anim_name_count, last_pick);
-}
-
-/* ================================================================== */
-/*  LVGL settings UI callbacks                                         */
-/* ================================================================== */
-
-/**
- * @brief LVGL settings callback: user selected a new model.
- * @param[in] path      Full path to the model file
- * @param[in] user_data Unused
- * @return none
- */
-static void __on_model_change(const char *path, void *user_data)
-{
-    (void)user_data;
-    vrm_viewer_reload_model(path);
-}
-
-/**
- * @brief LVGL settings callback: user selected an animation by index.
- *
- * Uses the same pending-flag mechanism as vrm_viewer_play_animation()
- * to pass the request safely to the render loop.
- */
-static volatile int s_sui_anim_req_idx     = -1;
-static volatile int s_sui_anim_req_pending = 0;
-
-static void __on_anim_change(int index, void *user_data)
-{
-    (void)user_data;
-    s_sui_anim_req_idx     = index;
-    s_sui_anim_req_pending = 1;
-}
-
-/**
- * @brief LVGL settings callback: user selected a new scene.
- * @param[in] dir       Scene directory path ("" for no skybox)
- * @param[in] user_data Unused
- * @return none
- */
-static void __on_scene_change(const char *dir, void *user_data)
-{
-    (void)user_data;
-    vrm_viewer_reload_scene(dir);
-}
-
-/**
- * @brief LVGL settings callback: camera lock toggled.
- * @param[in] locked    1 = locked, 0 = unlocked
- * @param[in] user_data Unused
- * @return none
- */
-static void __on_camera_lock(int locked, void *user_data)
-{
-    (void)user_data;
-    (void)locked;
-}
-
-/**
- * @brief LVGL settings callback: subtitle toggled.
- * @param[in] enabled   1 = enabled, 0 = disabled
- * @param[in] user_data Unused
- * @return none
- */
-static void __on_subtitle_toggle(int enabled, void *user_data)
-{
-    (void)user_data;
-    (void)enabled;
-}
-
-/**
- * @brief LVGL settings callback: fullscreen toggled.
- * @param[in] enabled   1 = fullscreen, 0 = windowed
- * @param[in] user_data Pointer to SDL_Window
- * @return none
- */
-static void __on_fullscreen_toggle(int enabled, void *user_data)
-{
-    SDL_Window *win = (SDL_Window *)user_data;
-    if (!win) {
-        return;
-    }
-    SDL_SetWindowFullscreen(win,
-        enabled ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
-}
-
-static float s_spec_yaw      = 0.0f;
-static float s_spec_pitch    = 0.15f;
-static float s_spec_dist     = 3.0f;
-static float s_spec_target[3] = {0};
-static int   s_spec_inited   = 0;
-
-/**
- * @brief Settings callback: spectator mode toggled.
- * @param[in] enabled   1 = spectator on, 0 = off
- * @param[in] user_data unused
- * @return none
- */
-static void __on_spectator_toggle(int enabled, void *user_data)
-{
-    (void)user_data;
-    if (enabled) {
-        s_spec_inited = 0;
-    }
-}
-
-/**
- * @brief Extract the directory portion of a file path.
- * @param[out] out      Output buffer
- * @param[in]  out_size Buffer size
- * @param[in]  path     File path
- * @return none
- */
-static void __path_dirname(char *out, size_t out_size, const char *path)
-{
-    char tmp[RELOAD_PATH_MAX];
-    strncpy(tmp, path, sizeof(tmp) - 1);
-    tmp[sizeof(tmp) - 1] = '\0';
-    char *d = dirname(tmp);
-    strncpy(out, d, out_size - 1);
-    out[out_size - 1] = '\0';
-}
-
-/**
- * @brief Extract the filename portion of a file path.
- * @param[out] out      Output buffer
- * @param[in]  out_size Buffer size
- * @param[in]  path     File path
- * @return none
- */
-static void __path_basename(char *out, size_t out_size, const char *path)
-{
-    char tmp[RELOAD_PATH_MAX];
-    strncpy(tmp, path, sizeof(tmp) - 1);
-    tmp[sizeof(tmp) - 1] = '\0';
-    char *b = basename(tmp);
-    strncpy(out, b, out_size - 1);
-    out[out_size - 1] = '\0';
-}
 
 int vrm_viewer_run(const char *model_path, const char *vrma_dir)
 {
@@ -1325,6 +184,7 @@ int vrm_viewer_run(const char *model_path, const char *vrma_dir)
 
     /* ---- compile shaders ---- */
     GLuint model_prog = __link_program(s_model_vs, s_model_fs);
+    GLuint mtoon_prog = mtoon_create_program();
     GLuint grid_prog  = __link_program(s_grid_vs, s_grid_fs);
     GLuint bg_prog    = __link_program(s_bg_vs, s_bg_fs);
     GLuint shadow_prog = __link_program(s_shadow_vs, s_shadow_fs);
@@ -1333,8 +193,9 @@ int vrm_viewer_run(const char *model_path, const char *vrma_dir)
 
     /* ---- upload meshes ---- */
     gpu_mesh_t *gpu = (gpu_mesh_t *)calloc(model.mesh_count, sizeof(gpu_mesh_t));
-    for (uint32_t i = 0; i < model.mesh_count; i++)
-        __upload_mesh(&gpu[i], &model.meshes[i], &model);
+    for (uint32_t i = 0; i < model.mesh_count; i++) {
+        __upload_mesh(&gpu[i], &model.meshes[i], &model, i);
+    }
 
     printf("[vrm_viewer] uploaded %u meshes to GPU\n", model.mesh_count);
 
@@ -1485,7 +346,7 @@ int vrm_viewer_run(const char *model_path, const char *vrma_dir)
         int init_fullscreen = (SDL_GetWindowFlags(window) &
                                SDL_WINDOW_FULLSCREEN_DESKTOP) ? 1 : 0;
 
-        settings_overlay_cfg_t sui_cfg = {
+        vrm_overlay_cfg_t sui_cfg = {
             .model_dir        = model_dir,
             .current_model    = model_basename,
             .scene_parent_dir = scene_parent,
@@ -1506,7 +367,7 @@ int vrm_viewer_run(const char *model_path, const char *vrma_dir)
             .user_data        = window,
         };
 
-        settings_overlay_init(&sui_cfg);
+        vrm_overlay_init(&sui_cfg);
     }
 
     /* ---- main loop ---- */
@@ -1542,11 +403,11 @@ int vrm_viewer_run(const char *model_path, const char *vrma_dir)
         /* ---- events ---- */
         SDL_Event ev;
         while (SDL_PollEvent(&ev)) {
-            if (settings_overlay_handle_event(&ev, win_w, win_h)) {
+            if (vrm_overlay_handle_event(&ev, win_w, win_h)) {
                 continue;
             }
-            int cam_locked = settings_overlay_camera_locked();
-            int spectator  = settings_overlay_spectator();
+            int cam_locked = vrm_overlay_camera_locked();
+            int spectator  = vrm_overlay_spectator();
 
             switch (ev.type) {
             case SDL_QUIT:
@@ -1837,7 +698,7 @@ int vrm_viewer_run(const char *model_path, const char *vrma_dir)
 
             /* Free GPU meshes */
             for (uint32_t mi = 0; mi < model.mesh_count; mi++) {
-                if (gpu[mi].tex_id) { glDeleteTextures(1, &gpu[mi].tex_id); }
+                mtoon_free_mesh_textures(&gpu[mi]);
                 glDeleteVertexArrays(1, &gpu[mi].vao);
                 glDeleteBuffers(1, &gpu[mi].vbo);
                 glDeleteBuffers(1, &gpu[mi].ebo);
@@ -1921,7 +782,7 @@ int vrm_viewer_run(const char *model_path, const char *vrma_dir)
             /* Re-upload meshes */
             gpu = (gpu_mesh_t *)calloc(model.mesh_count, sizeof(gpu_mesh_t));
             for (uint32_t mi = 0; mi < model.mesh_count; mi++) {
-                __upload_mesh(&gpu[mi], &model.meshes[mi], &model);
+                __upload_mesh(&gpu[mi], &model.meshes[mi], &model, mi);
             }
 
             /* Recreate bone TBO */
@@ -1973,7 +834,7 @@ int vrm_viewer_run(const char *model_path, const char *vrma_dir)
             cam_target[1] = model.center[1];
             cam_target[2] = model.center[2];
 
-            settings_overlay_update_anims(anim_names, anim_name_count, 0);
+            vrm_overlay_update_anims(anim_names, anim_name_count, 0);
 
             start_ticks = SDL_GetTicks();
             s_last_interact_ticks = SDL_GetTicks();
@@ -2208,7 +1069,7 @@ int vrm_viewer_run(const char *model_path, const char *vrma_dir)
         float cam_look_target[3];
         float up[3] = { 0.0f, 1.0f, 0.0f };
 
-        int spectator_on = settings_overlay_spectator();
+        int spectator_on = vrm_overlay_spectator();
         if (spectator_on) {
             if (!s_spec_inited) {
                 s_spec_yaw   = cam_yaw;
@@ -2315,44 +1176,14 @@ int vrm_viewer_run(const char *model_path, const char *vrma_dir)
             glDisable(GL_BLEND);
         }
 
-        /* ---- draw model (toon cel shading) ---- */
-        glUseProgram(model_prog);
-        glUniformMatrix4fv(glGetUniformLocation(model_prog, "u_mvp"), 1, GL_FALSE, mvp);
-        glUniformMatrix4fv(glGetUniformLocation(model_prog, "u_model"), 1, GL_FALSE, model_mat);
+        /* ---- draw model (MToon + legacy fallback) ---- */
         {
             float ld[3] = { 0.0f, 0.15f, 1.0f };
             float len = sqrtf(ld[0]*ld[0] + ld[1]*ld[1] + ld[2]*ld[2]);
             ld[0] /= len; ld[1] /= len; ld[2] /= len;
-            glUniform3fv(glGetUniformLocation(model_prog, "u_light_dir"), 1, ld);
+            mtoon_draw_model(&model, gpu, mtoon_prog, model_prog,
+                             mvp, model_mat, ld, bone_tbo_tex, white_tex);
         }
-
-        glUniform1i(glGetUniformLocation(model_prog, "u_texture"), 0);
-        glUniform1i(glGetUniformLocation(model_prog, "u_bone_tbo"), 1);
-
-        if (bone_tbo_tex) {
-            glActiveTexture(GL_TEXTURE1);
-            glBindTexture(GL_TEXTURE_BUFFER, bone_tbo_tex);
-        }
-
-        glEnable(GL_BLEND);
-        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-
-        for (uint32_t i = 0; i < model.mesh_count; i++) {
-            glUniform4fv(glGetUniformLocation(model_prog, "u_base_color"), 1, gpu[i].color);
-            glUniform1i(glGetUniformLocation(model_prog, "u_has_texture"), gpu[i].has_texture);
-            glUniform1i(glGetUniformLocation(model_prog, "u_skinned"), gpu[i].has_bones);
-
-            glActiveTexture(GL_TEXTURE0);
-            if (gpu[i].has_texture) {
-                glBindTexture(GL_TEXTURE_2D, gpu[i].tex_id);
-            } else {
-                glBindTexture(GL_TEXTURE_2D, white_tex);
-            }
-
-            glBindVertexArray(gpu[i].vao);
-            glDrawElements(GL_TRIANGLES, (GLsizei)gpu[i].index_count, GL_UNSIGNED_INT, 0);
-        }
-        glDisable(GL_BLEND);
 
         /* ---- Ground shadow ---- */
         glUseProgram(ground_shadow_prog);
@@ -2399,14 +1230,14 @@ int vrm_viewer_run(const char *model_path, const char *vrma_dir)
         glDisable(GL_BLEND);
 
         /* ---- Settings overlay + subtitle (2D on top of 3D) ---- */
-        settings_overlay_render(win_w, win_h);
+        vrm_overlay_render(win_w, win_h);
 
         SDL_GL_SwapWindow(window);
     }
 
     /* ---- cleanup ---- */
     for (uint32_t i = 0; i < model.mesh_count; i++) {
-        if (gpu[i].tex_id) glDeleteTextures(1, &gpu[i].tex_id);
+        mtoon_free_mesh_textures(&gpu[i]);
         glDeleteVertexArrays(1, &gpu[i].vao);
         glDeleteBuffers(1, &gpu[i].vbo);
         glDeleteBuffers(1, &gpu[i].ebo);
@@ -2430,13 +1261,16 @@ int vrm_viewer_run(const char *model_path, const char *vrma_dir)
     glDeleteBuffers(1, &s_ground_vbo);
     glDeleteBuffers(1, &s_ground_ebo);
     glDeleteProgram(model_prog);
+    if (mtoon_prog) {
+        glDeleteProgram(mtoon_prog);
+    }
     glDeleteProgram(grid_prog);
     glDeleteProgram(bg_prog);
     glDeleteProgram(shadow_prog);
     glDeleteProgram(ground_shadow_prog);
     skybox_destroy(&skybox);
 
-    settings_overlay_destroy();
+    vrm_overlay_destroy();
 
     /* Nullify global emotion ctx before shutdown to prevent dangling access */
     s_emo_ctx = NULL;

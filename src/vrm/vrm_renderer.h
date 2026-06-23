@@ -1,10 +1,13 @@
 /**
- * @file gl_renderer.h
+ * @file vrm_renderer.h
  * @brief OpenGL + SDL2 renderer for VRM models with skeletal animation.
+ * @version 1.0
+ * @date 2025-06-23
+ * @copyright Copyright (c) Tuya Inc. All Rights Reserved.
  */
 
-#ifndef GL_RENDERER_H
-#define GL_RENDERER_H
+#ifndef VRM_RENDERER_H
+#define VRM_RENDERER_H
 
 #include <SDL2/SDL.h>
 
@@ -20,9 +23,9 @@
  *   Left-drag    : rotate model   (disabled when camera is locked)
  *   Left / Right : switch animation
  *   Space        : pause / resume animation
- *   R            : reset model rotation
- *   Gear icon    : toggle settings panel (top-left corner)
- *   ESC / close  : quit
+ *   R           : reset model rotation
+ *   Gear icon   : toggle settings panel (top-left corner)
+ *   ESC / close : quit
  *
  * @param[in] model_path  Path to a .vrm / .glb / .pmx / .fbx model file.
  * @param[in] vrma_dir    Directory containing .vrma animation files (NULL = none).
@@ -72,7 +75,7 @@ void vrm_viewer_set_blendshape(const char *expr_name, float weight);
 void vrm_viewer_clear_blendshapes(void);
 
 /**
- * @brief Set the subtitle text shown on the LVGL display.
+ * @brief Set the subtitle text shown on the overlay.
  *
  * The subtitle is only displayed when the subtitle toggle is enabled in the
  * settings UI.  Pass NULL or "" to clear.
@@ -100,4 +103,4 @@ void vrm_viewer_reload_model(const char *model_path);
  */
 void vrm_viewer_reload_scene(const char *scene_dir);
 
-#endif /* GL_RENDERER_H */
+#endif /* VRM_RENDERER_H */

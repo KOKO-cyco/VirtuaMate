@@ -20,8 +20,8 @@
 #include "tuya_kconfig.h"
 
 #ifdef VRM_MODEL_PATH
-#include "gl_renderer.h"
-#include "emotion/text_emotion.h"
+#include "vrm_renderer.h"
+#include "vrm_text_emotion.h"
 #endif
 
 #if defined(ENABLE_WIFI) && (ENABLE_WIFI == 1)

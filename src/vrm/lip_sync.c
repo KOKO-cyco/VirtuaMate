@@ -5,7 +5,7 @@
  * See lip_sync.h for the algorithm description.
  */
 
-#include "lip_sync.h"
+#include "vrm_lip_sync.h"
 
 #include <math.h>
 #include <string.h>
