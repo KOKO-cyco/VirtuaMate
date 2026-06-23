@@ -5,14 +5,17 @@
  */
 
 #include "tal_api.h"
-
+#include "tal_thread.h"
 #include "netmgr.h"
 
+#include "ai_agent.h"
 #include "ai_chat_main.h"
 #include "ducky_claw_chat.h"
 #include "agent_loop.h"
+#include "acp_client.h"
 
 #include "app_im.h"
+#include "sys_bus.h"
 #include "tal_log.h"
 #include "tuya_kconfig.h"
 
@@ -53,6 +56,8 @@ static TIMER_ID            sg_disp_status_tm;
 
 static void __printf_free_heap_tm_cb(TIMER_ID timer_id, void *arg)
 {
+    // extern void tal_thread_dump_watermark(void);
+    // tal_thread_dump_watermark();
 #if defined(ENABLE_EXT_RAM) && (ENABLE_EXT_RAM == 1)
     uint32_t free_heap       = tal_system_get_free_heap_size();
     uint32_t free_psram_heap = tal_psram_get_free_heap_size();
@@ -175,7 +180,33 @@ static void __ai_chat_handle_event(AI_NOTIFY_EVENT_T *event)
         return;
     }
 
+
     switch (event->type) {
+    case AI_USER_EVT_ASR_OK: {
+        /* Restore TTS and UI output for this iteration. */
+#if 0
+        AI_NOTIFY_TEXT_T *asr = (AI_NOTIFY_TEXT_T *)event->data;
+        if (!asr || asr->datalen == 0 || !asr->data) {
+            break;
+        }
+        char *asr_text = (char *)tal_malloc(asr->datalen + 1);
+        if (asr_text) {
+            memcpy(asr_text, asr->data, asr->datalen);
+            asr_text[asr->datalen] = '\0';
+            PR_DEBUG("[acp] asr inbound: %.64s", asr_text);
+
+            sys_msg_t msg = {0};
+            strncpy(msg.channel, SYS_CHAN_ACP, sizeof(msg.channel) - 1);
+            msg.channel[sizeof(msg.channel) - 1] = '\0';
+            PR_DEBUG("asr inbound: channel=%s chat_id=%s", msg.channel, msg.chat_id);
+            msg.content = asr_text;
+            if (sys_bus_push_inbound(&msg) != OPRT_OK) {
+                PR_ERR("sys_bus_push_inbound failed");
+                tal_free(asr_text);
+            }
+        }
+#endif
+    } break;
     case AI_USER_EVT_TEXT_STREAM_START: {
         if (stream_data == NULL) {
 #if defined(ENABLE_EXT_RAM) && (ENABLE_EXT_RAM == 1)
@@ -195,15 +226,11 @@ static void __ai_chat_handle_event(AI_NOTIFY_EVENT_T *event)
 #endif
 
         AI_NOTIFY_TEXT_T *text = (AI_NOTIFY_TEXT_T *)event->data;
-        if (text && text->datalen > 0 && text->data) {
-            uint32_t copy_len = text->datalen;
-            if (copy_len > STREAM_DATA_MAX_LEN - data_write_offset - 1) {
-                copy_len = STREAM_DATA_MAX_LEN - data_write_offset - 1;
-            }
-            memcpy(stream_data + data_write_offset, text->data, copy_len);
-            data_write_offset += copy_len;
+        if (text && text->datalen > 0 && text->data && data_write_offset + text->datalen <= STREAM_DATA_MAX_LEN) {
+            memcpy(stream_data + data_write_offset, text->data, text->datalen);
+            data_write_offset += text->datalen;
 #ifdef VRM_MODEL_PATH
-            text_emotion_feed((const char *)text->data, (int)copy_len);
+            text_emotion_feed((const char *)text->data, (int)text->datalen);
 #endif
         }
 #ifdef VRM_MODEL_PATH
@@ -214,6 +241,7 @@ static void __ai_chat_handle_event(AI_NOTIFY_EVENT_T *event)
         AI_NOTIFY_TEXT_T *text = (AI_NOTIFY_TEXT_T *)event->data;
 
         if (data_write_offset + text->datalen >= STREAM_DATA_MAX_LEN) {
+            /* Only flush to IM if we are NOT in a tool-loop iteration */
             if (!agent_loop_in_tool_loop()) {
                 app_im_bot_send_message((char *)stream_data);
             }
@@ -221,27 +249,33 @@ static void __ai_chat_handle_event(AI_NOTIFY_EVENT_T *event)
             data_write_offset = 0;
         }
 
-        uint32_t copy_len = text->datalen;
-        if (copy_len > STREAM_DATA_MAX_LEN - data_write_offset - 1) {
-            copy_len = STREAM_DATA_MAX_LEN - data_write_offset - 1;
-        }
-        memcpy(stream_data + data_write_offset, text->data, copy_len);
-        data_write_offset += copy_len;
+        memcpy(stream_data + data_write_offset, text->data, text->datalen);
+        data_write_offset += text->datalen;
 #ifdef VRM_MODEL_PATH
-        text_emotion_feed((const char *)text->data, (int)copy_len);
+        if (text && text->data && text->datalen > 0) {
+            text_emotion_feed((const char *)text->data, (int)text->datalen);
+        }
         vrm_viewer_set_subtitle((char *)stream_data);
 #endif
     } break;
     case AI_USER_EVT_TEXT_STREAM_STOP: {
-        stream_data[data_write_offset] = '\0';
+        /* Accumulate the final chunk into stream_data; do NOT post the
+         * semaphore here.  The AI may still have MCP tool calls to execute
+         * after the text stream ends.  We wait for AI_USER_EVT_END instead. */
 #ifdef VRM_MODEL_PATH
         text_emotion_flush();
 #endif
         build_current_context("assistant", (char *)stream_data);
+        /* Keep stream_data intact so AI_USER_EVT_END can read it */
     } break;
     case AI_USER_EVT_END: {
+        /* The full AI turn is complete (text + all MCP tool calls done).
+         * Pass the accumulated text to the agent loop and unblock it. */
         agent_loop_set_last_response((char *)stream_data);
         agent_loop_notify_turn_done();
+
+        memset(stream_data, 0, STREAM_DATA_MAX_LEN);
+        data_write_offset = 0;
     } break;
     case AI_USER_EVT_LLM_EMOTION:
     case AI_USER_EVT_EMOTION: {

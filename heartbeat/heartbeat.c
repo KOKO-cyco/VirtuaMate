@@ -16,7 +16,7 @@
 #include "tool_files.h"
 
 #include "tal_api.h"
-#include "ai_agent.h"
+#include "sys_bus.h"
 
 #include <ctype.h>
 #include <string.h>
@@ -59,10 +59,15 @@ static bool heartbeat_has_tasks(void)
         return false;
     }
 
-    char line[256]  = {0};
+    char *line = (char *)claw_malloc(256);
+    if (!line) {
+        claw_fclose(f);
+        return false;
+    }
+    memset(line, 0, 256);
     bool found_task = false;
 
-    while (claw_fgets(line, sizeof(line), f)) {
+    while (claw_fgets(line, 256, f)) {
         const char *p = line;
 
         /* Skip leading whitespace */
@@ -93,6 +98,7 @@ static bool heartbeat_has_tasks(void)
         break;
     }
 
+    claw_free(line);
     claw_fclose(f);
     return found_task;
 }
@@ -109,7 +115,16 @@ static bool heartbeat_send(void)
         return false;
     }
 
-    OPERATE_RET rt = ai_agent_send_text(HEARTBEAT_PROMPT);
+    sys_msg_t im = {0};
+    strncpy(im.channel, SYS_CHAN_HEARTBEAT, sizeof(im.channel) - 1);
+    im.content = claw_malloc(strlen(HEARTBEAT_PROMPT) + 1);
+    if (!im.content) {
+        PR_ERR("heartbeat: malloc failed");
+        return false;
+    }
+    strcpy(im.content, HEARTBEAT_PROMPT);
+
+    OPERATE_RET rt = sys_bus_push_inbound(&im);
     if (rt != OPRT_OK) {
         PR_WARN("Send heartbeat message failed: %d", rt);
         return false;

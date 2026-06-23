@@ -11,6 +11,8 @@
 #include "channels/telegram_bot.h"
 #include "channels/discord_bot.h"
 #include "channels/feishu_bot.h"
+#include "channels/weixin_bot.h"
+#include "channels/qqbot_channel.h"
 #include "proxy/http_proxy.h"
 
 #endif /* __IM_API_H__ */

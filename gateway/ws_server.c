@@ -14,7 +14,7 @@
 #include "ws_server.h"
 #include "tuya_app_config.h"
 #include "tool_files.h"
-#include "bus/message_bus.h"
+#include "sys_bus.h"
 #include "cJSON.h"
 #include "mix_method.h"
 #include "tal_hash.h"
@@ -340,19 +340,25 @@ static OPERATE_RET ws_do_handshake_locked(ws_client_t *client)
         return rt;
     }
 
-    char resp[256] = {0};
-    int  n         = snprintf(resp, sizeof(resp),
+    char *resp = (char *)claw_malloc(256);
+    if (!resp) {
+        return OPRT_MALLOC_FAILED;
+    }
+    memset(resp, 0, 256);
+    int  n         = snprintf(resp, 256,
                               "HTTP/1.1 101 Switching Protocols\r\n"
                               "Upgrade: websocket\r\n"
                               "Connection: Upgrade\r\n"
                               "Sec-WebSocket-Accept: %s\r\n\r\n",
                               accept_key);
-    if (n <= 0 || (size_t)n >= sizeof(resp)) {
+    if (n <= 0 || (size_t)n >= 256) {
+        claw_free(resp);
         return OPRT_BUFFER_NOT_ENOUGH;
     }
 
     rt = ws_send_all(client->fd, (const uint8_t *)resp, (size_t)n);
     if (rt != OPRT_OK) {
+        claw_free(resp);
         return rt;
     }
 
@@ -368,6 +374,7 @@ static OPERATE_RET ws_do_handshake_locked(ws_client_t *client)
     client->rx_len = remain;
 
     PR_INFO("handshake success chat_id=%s fd=%d", client->chat_id, client->fd);
+    claw_free(resp);
     return OPRT_OK;
 }
 
@@ -517,13 +524,13 @@ static void ws_handle_text_message_locked(ws_client_t *client,
     memcpy(cbuf, content->valuestring, clen);
     cbuf[clen] = '\0';
 
-    im_msg_t msg = {0};
-    snprintf(msg.channel, sizeof(msg.channel), "%s", IM_CHAN_WS);
+    sys_msg_t msg = {0};
+    snprintf(msg.channel, sizeof(msg.channel), "%s", SYS_CHAN_WS);
     snprintf(msg.chat_id, sizeof(msg.chat_id), "%s", client->chat_id);
     msg.content = cbuf;
 
-    if (message_bus_push_inbound(&msg) != OPRT_OK) {
-        PR_ERR("ws: message_bus_push_inbound failed");
+    if (sys_bus_push_inbound(&msg) != OPRT_OK) {
+        PR_ERR("ws: sys_bus_push_inbound failed");
         claw_free(cbuf);
     }
 
@@ -780,6 +787,14 @@ OPERATE_RET ws_server_start(void)
         return OPRT_OK;
     }
 
+    ws_load_auth_token();
+
+    /* If token is empty, skip initialization */
+    if (s_ws_token[0] == '\0') {
+        PR_WARN("ws_server: token is empty, skip initialization");
+        return OPRT_OK;
+    }
+
     if (!s_ws_mutex) {
         OPERATE_RET rt = tal_mutex_create_init(&s_ws_mutex);
         if (rt != OPRT_OK) {
@@ -788,7 +803,6 @@ OPERATE_RET ws_server_start(void)
         }
     }
 
-    ws_load_auth_token();
     ws_clients_init();
 
     s_listen_fd = tal_net_socket_create(PROTOCOL_TCP);

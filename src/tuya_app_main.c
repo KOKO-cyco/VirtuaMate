@@ -20,6 +20,7 @@
 #include "cJSON.h"
 #include "tal_api.h"
 #include "tuya_app_config.h"
+#include "app_base_config.h"
 #include "tuya_iot.h"
 #include "tuya_iot_dp.h"
 #include "netmgr.h"
@@ -41,12 +42,18 @@
 
 #include "board_com_api.h"
 
+#if defined(ENABLE_BLUETOOTH) && (ENABLE_BLUETOOTH == 1)
+#include "netcfg.h"
+#include "ble_mgr.h"
+#endif
+
 #include "ducky_claw_chat.h"
 #include "reset_netcfg.h"
 #include "app_im.h"
-#include "cli/serial_cli.h"
+#include "sys_bus.h"
 #include "tools_register.h"
 #include "ws_server.h"
+#include "acp_client.h"
 #include "agent_loop.h"
 
 #include "tuya_kconfig.h"
@@ -60,7 +67,7 @@
 /* Tuya device handle */
 tuya_iot_client_t ai_client;
 
-/* Tuya IoT yield thread handle */
+/* Tuya IoT yield thread handle (used when VRM viewer blocks main thread) */
 static THREAD_HANDLE s_tuya_yield_thread = NULL;
 
 /* Tuya license information (uuid authkey) */
@@ -73,8 +80,8 @@ tuya_iot_license_t license;
 #define DPID_VOLUME 3
 
 static uint8_t _need_reset = 0;
-
-extern void tuya_app_cli_init(void);
+static char kv_product_id[32] = {0};
+extern void app_cli_init(void);
 /**
  * @brief user defined log output api, in this demo, it will use uart0 as log-tx
  *
@@ -192,7 +199,7 @@ void user_event_handler_on(tuya_iot_client_t *client, tuya_event_msg_t *event)
     case TUYA_EVENT_DIRECT_MQTT_CONNECTED: {
 #if defined(ENABLE_QRCODE) && (ENABLE_QRCODE == 1)
         char buffer[255];
-        sprintf(buffer, "https://smartapp.tuya.com/s/p?p=%s&uuid=%s&v=2.0", TUYA_PRODUCT_ID, license.uuid);
+        sprintf(buffer, "https://smartapp.tuya.com/s/p?p=%s&uuid=%s&v=2.0", kv_product_id, license.uuid);
         qrcode_string_output(buffer, user_log_output_cb, 0);
 #endif
     } break;
@@ -202,8 +209,26 @@ void user_event_handler_on(tuya_iot_client_t *client, tuya_event_msg_t *event)
 
     /* MQTT with tuya cloud is connected, device online */
     case TUYA_EVENT_MQTT_CONNECTED:
+#if defined(PLATFORM_ESP32) && (PLATFORM_ESP32 == 1)
+        /* NOTE: this is for ESP32 only */
+        uint32_t free_heap = tal_system_get_free_heap_size();
+        PR_INFO("BLE init Free heap size:%d", free_heap);
+        netcfg_stop(NETCFG_TUYA_BLE);
+        tuya_ble_deinit();
+        free_heap = tal_system_get_free_heap_size();
+        PR_INFO("BLE deinit Free heap size:%d", free_heap);
+#endif
         PR_INFO("Device MQTT Connected!");
-        tal_event_publish(EVENT_MQTT_CONNECTED, NULL);
+        NW_IP_S ip;
+        memset(&ip, 0, sizeof(ip));
+#if defined(ENABLE_WIFI) && (ENABLE_WIFI == 1)
+        OPERATE_RET op_ret = tal_wifi_get_ip(WF_STATION, &ip);
+        // PR_INFO("device init ip=%s", ip.ip);
+        if (OPRT_OK != op_ret) {
+            PR_ERR("get ip fail:%d", op_ret);
+            op_ret = OPRT_NOT_FOUND;
+        }
+#endif
 
         static uint8_t first = 1;
         if (first) {
@@ -331,24 +356,27 @@ void user_main(void)
     tal_sw_timer_init();
     tal_workq_init();
     tal_time_service_init();
+
     tal_cli_init();
-    tuya_app_cli_init();
-    serial_cli_init();
     tuya_authorize_init();
+    app_cli_init();
 
     reset_netconfig_start();
 
     if (OPRT_OK != tuya_authorize_read(&license)) {
-        license.uuid = TUYA_OPENSDK_UUID;
+        license.uuid    = TUYA_OPENSDK_UUID;
         license.authkey = TUYA_OPENSDK_AUTHKEY;
         PR_WARN("Replace the TUYA_OPENSDK_UUID and TUYA_OPENSDK_AUTHKEY contents, otherwise the demo cannot work.\n \
                 Visit https://platform.tuya.com/purchase/index?type=6 to get the open-sdk uuid and authkey.");
     }
 
+    /* Read product_id from KV (fallback to compile-time macro) */
+    app_cfg_get_product_id(kv_product_id, sizeof(kv_product_id));
+
     /* Initialize Tuya device configuration */
     ret = tuya_iot_init(&ai_client, &(const tuya_iot_config_t){
                                         .software_ver = PROJECT_VERSION,
-                                        .productkey = TUYA_PRODUCT_ID,
+                                        .productkey = kv_product_id,
                                         .uuid = license.uuid,
                                         .authkey = license.authkey,
                                         // .firmware_key      = TUYA_DEVICE_FIRMWAREKEY,
@@ -381,6 +409,11 @@ void user_main(void)
         PR_ERR("board_register_hardware failed rt:%d", ret);
     }
 
+    ret = sys_bus_init();
+    if (ret != OPRT_OK) {
+        PR_ERR("sys_bus_init failed rt:%d", ret);
+    }
+
     ret = ducky_claw_chat_init();
     if (ret != OPRT_OK) {
         PR_ERR("ducky_claw_chat_init failed rt:%d", ret);
@@ -401,6 +434,11 @@ void user_main(void)
         PR_ERR("tool_registry_init failed rt:%d", ret);
     }
 
+    ret = acp_client_init();
+    if (ret != OPRT_OK) {
+        PR_ERR("acp_client_init failed rt:%d", ret);
+    }
+
     ret = agent_loop_init();
     if (ret != OPRT_OK) {
         PR_ERR("agent_loop_init failed rt:%d", ret);
@@ -418,35 +456,36 @@ void user_main(void)
 
     reset_netconfig_check();
 
-#ifdef VRM_MODEL_PATH
-    {
+#if defined(VRM_MODEL_PATH)
+    if (VRM_MODEL_PATH[0] != '\0') {
         THREAD_CFG_T yield_cfg = {0};
         yield_cfg.stackDepth = 4096;
         yield_cfg.priority = 4;
         yield_cfg.thrdname = "tuya_yield";
         tal_thread_create_and_start(&s_tuya_yield_thread, NULL, NULL,
                                     tuya_yield_thread, NULL, &yield_cfg);
-    }
 
-    {
-        const char *vrm_model_path = VRM_MODEL_PATH;
+        {
+            const char *vrm_model_path = VRM_MODEL_PATH;
 #ifdef VRM_ANIM_DIR
-        const char *vrm_anim_dir = (VRM_ANIM_DIR[0] != '\0') ? VRM_ANIM_DIR : NULL;
+            const char *vrm_anim_dir = (VRM_ANIM_DIR[0] != '\0') ? VRM_ANIM_DIR : NULL;
 #else
-        const char *vrm_anim_dir = NULL;
+            const char *vrm_anim_dir = NULL;
 #endif
-        PR_NOTICE("Starting VRM viewer: model=%s anim_dir=%s", vrm_model_path,
-                  vrm_anim_dir ? vrm_anim_dir : "(none)");
-        int vrm_ret = vrm_viewer_run(vrm_model_path, vrm_anim_dir);
-        if (vrm_ret != 0) {
-            PR_ERR("vrm_viewer_run() failed: %d", vrm_ret);
+            PR_NOTICE("Starting VRM viewer: model=%s anim_dir=%s", vrm_model_path,
+                      vrm_anim_dir ? vrm_anim_dir : "(none)");
+            int vrm_ret = vrm_viewer_run(vrm_model_path, vrm_anim_dir);
+            if (vrm_ret != 0) {
+                PR_ERR("vrm_viewer_run() failed: %d", vrm_ret);
+            }
+        }
+    } else
+#endif
+    {
+        for (;;) {
+            tuya_iot_yield(&ai_client);
         }
     }
-#else
-    for (;;) {
-        tuya_iot_yield(&ai_client);
-    }
-#endif
 }
 
 /**

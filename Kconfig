@@ -1,4 +1,16 @@
-menu "configure app (DuckyClaw) "
+menu "configure app (DuckyClaw / Linux)"
+
+    config SYS_BUS_OUTBOUND_STACK_SIZE
+        int "SYS bus outbound thread stack size (bytes)"
+        default 8192
+        help
+            Stack size in bytes for the SYS bus outbound thread (default 8*1024).
+
+    config IM_BRIDGE_STACK_SIZE
+        int "IM bridge thread stack size (bytes)"
+        default 4096
+        help
+            Stack size in bytes for the IM bridge thread (default 4*1024).
 
 rsource "./ai_components/Kconfig"
 rsource "./cron_service/Kconfig"
@@ -11,14 +23,15 @@ menu "VRM Viewer Config"
 
 config VRM_MODEL_PATH
     string "3D model file path (VRM/PMX/GLB/FBX)"
-    default "/home/pi/avatar.vrm"
+    default "resources/models/Hayaseyuuka.vrm"
     help
-      Path to the 3D model file to load on the Raspberry Pi.
+      Path to the 3D model file to load.
       Supported formats: VRM, PMX, GLB, GLTF, FBX, OBJ, etc.
+      Leave empty to disable the VRM viewer.
 
 config VRM_ANIM_DIR
     string "VRMA animation directory (optional)"
-    default ""
+    default "resources/animations"
     help
       Path to a directory containing .vrma animation files.
       All .vrma files will be loaded and can be switched at runtime.
@@ -41,21 +54,15 @@ config VRM_SCENE_DIR
     default ""
     help
       Path to a directory containing cubemap face images for the skybox.
-      The directory should contain 6 images named by any of these conventions:
-        right/left/top/bottom/front/back  (.jpg/.png/.bmp/.tga)
-        px/nx/py/ny/pz/nz                (.jpg/.png/.bmp/.tga)
-        posx/negx/posy/negy/posz/negz    (.jpg/.png/.bmp/.tga)
       Leave empty to use the default gradient background.
 
 config VRM_SCENE_PARENT_DIR
     string "Scene parent directory (contains skybox folders)"
-    default ""
+    default "resources/scenes"
     help
       Parent directory that contains multiple skybox cubemap sub-directories.
       The settings overlay will scan this directory and list every sub-directory
-      as a selectable scene. Each sub-directory must contain 6 cubemap face
-      images (same naming convention as VRM_SCENE_DIR).
-      If empty, the parent of VRM_SCENE_DIR is used as fallback.
+      as a selectable scene.
 
 endmenu
 

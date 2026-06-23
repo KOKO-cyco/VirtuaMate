@@ -170,74 +170,6 @@ static OPERATE_RET __ai_images_process(cJSON *root)
 }
 #endif 
 
-/**
- * @brief Strip LLM content-block wrappers from a string in-place.
- *
- * Some LLM models emit internal content-block representations as text, e.g.
- *   [{'text': 'hello', 'type': 'text'}]
- *   [{"text": "hello", "type": "text"}]
- * This function extracts just the inner text values and removes the wrappers.
- * The result is always <= the original length, so in-place is safe.
- *
- * @param[in,out] s  NUL-terminated string to sanitize.
- */
- static void __strip_content_blocks(char *s)
- {
-     if (!s || !s[0]) return;
- 
-     char *rd = s;
-     char *wr = s;
- 
-     while (*rd) {
-         if (rd[0] == '[' && rd[1] == '{') {
-             /* Find the 'text' key value inside this block.
-              * Look for  'text': '  or  "text": "  */
-             const char *tkey = strstr(rd, "'text':");
-             if (!tkey || tkey > rd + 80) {
-                 tkey = strstr(rd, "\"text\":");
-             }
- 
-             if (tkey && tkey < rd + 120) {
-                 const char *p = tkey + 7; /* skip past key + colon */
-                 while (*p == ' ') p++;
- 
-                 char quote = *p;
-                 if (quote == '\'' || quote == '"') {
-                     p++;
-                     const char *text_start = p;
- 
-                     /* Scan for the closing quote, handling \\n etc. */
-                     while (*p && !(*p == quote && *(p - 1) != '\\')) {
-                         p++;
-                     }
- 
-                     /* Copy the inner text */
-                     while (text_start < p) {
-                         if (*text_start == '\\' && *(text_start + 1) == 'n') {
-                             *wr++ = '\n';
-                             text_start += 2;
-                         } else {
-                             *wr++ = *text_start++;
-                         }
-                     }
- 
-                     /* Skip past the closing  }]  */
-                     const char *end = strstr(p, "}]");
-                     if (end) {
-                         rd = (char *)(end + 2);
-                         continue;
-                     }
-                 }
-             }
- 
-             /* Not a recognized block — copy the '[' and move on */
-             *wr++ = *rd++;
-         } else {
-             *wr++ = *rd++;
-         }
-     }
-     *wr = '\0';
- } 
 
 /**
  * @brief Process NLG (Natural Language Generation) text stream.
@@ -270,8 +202,6 @@ static OPERATE_RET __ai_nlg_process(cJSON *root, bool eof)
     if (!content) {
         content = "";
     }
-
-    __strip_content_blocks(content);
 
     AI_NOTIFY_TEXT_T text;
     text.data      = (char *)content;

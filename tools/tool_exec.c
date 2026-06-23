@@ -1,5 +1,17 @@
-#include "tool_exec.h"
+/**
+ * @file tool_exec.c
+ * @brief MCP exec/system tools for DuckyClaw
+ * @version 0.2
+ * @date 2026   -04-20
+ *
+ * @copyright Copyright (c) 2021-2026 Tuya Inc. All Rights Reserved.
+ *
+ * Implements exec, get_system_info, list_devices, handle_command MCP tools
+ * using the ai_mcp_server.h interface.
+ */
 
+#include "tool_exec.h"
+#include "app_base_config.h"
 #include "ai_mcp_server.h"
 #include "cJSON.h"
 #include "tal_api.h"
@@ -186,6 +198,15 @@ static OPERATE_RET __pi_system_exec_capture(const char *command,
     bool child_exited = false;
     int status = 0;
 
+    char *tmp = (char *)claw_malloc(1024);
+    if (!tmp) {
+        close(pipe_fd[0]);
+        (void)kill(pid, SIGKILL);
+        (void)waitpid(pid, NULL, 0);
+        tal_free(buf);
+        return OPRT_MALLOC_FAILED;
+    }
+
     uint32_t start_ms = __now_ms();
 
     while (1) {
@@ -206,8 +227,7 @@ static OPERATE_RET __pi_system_exec_capture(const char *command,
 
         int sel = select(pipe_fd[0] + 1, &rfds, NULL, NULL, &tv);
         if (sel > 0 && FD_ISSET(pipe_fd[0], &rfds)) {
-            char tmp[1024];
-            ssize_t n = read(pipe_fd[0], tmp, sizeof(tmp));
+            ssize_t n = read(pipe_fd[0], tmp, 1024);
             if (n > 0) {
                 size_t to_copy = (size_t)n;
                 if (used + to_copy > PI_SYS_MAX_OUTPUT_BYTES) {
@@ -224,9 +244,8 @@ static OPERATE_RET __pi_system_exec_capture(const char *command,
         }
 
         if (child_exited) {
-            char tmp[1024];
             while (used < PI_SYS_MAX_OUTPUT_BYTES) {
-                ssize_t n = read(pipe_fd[0], tmp, sizeof(tmp));
+                ssize_t n = read(pipe_fd[0], tmp, 1024);
                 if (n <= 0) {
                     break;
                 }
@@ -251,6 +270,7 @@ static OPERATE_RET __pi_system_exec_capture(const char *command,
                 (void)kill(pid, SIGKILL);
                 (void)waitpid(pid, &status, 0);
                 close(pipe_fd[0]);
+                claw_free(tmp);
                 buf[used] = '\0';
                 *out_buf = buf;
                 if (out_len) {
@@ -265,6 +285,7 @@ static OPERATE_RET __pi_system_exec_capture(const char *command,
     }
 
     close(pipe_fd[0]);
+    claw_free(tmp);
 
     buf[used] = '\0';
     *out_buf = buf;
@@ -320,6 +341,12 @@ static void __add_netifs(cJSON *arr)
         return;
     }
 
+    char *path = (char *)claw_malloc(256);
+    if (!path) {
+        closedir(d);
+        return;
+    }
+
     struct dirent *ent;
     while ((ent = readdir(d)) != NULL) {
         if (ent->d_name[0] == '.') {
@@ -334,16 +361,14 @@ static void __add_netifs(cJSON *arr)
 
         cJSON_AddStringToObject(obj, "name", ifname);
 
-        char path[256];
-
-        snprintf(path, sizeof(path), "/sys/class/net/%s/address", ifname);
+        snprintf(path, 256, "/sys/class/net/%s/address", ifname);
         char *mac = __read_small_file_trim(path);
         if (mac) {
             cJSON_AddStringToObject(obj, "mac", mac);
             tal_free(mac);
         }
 
-        snprintf(path, sizeof(path), "/sys/class/net/%s/operstate", ifname);
+        snprintf(path, 256, "/sys/class/net/%s/operstate", ifname);
         char *state = __read_small_file_trim(path);
         if (state) {
             cJSON_AddStringToObject(obj, "state", state);
@@ -353,6 +378,7 @@ static void __add_netifs(cJSON *arr)
         cJSON_AddItemToArray(arr, obj);
     }
 
+    claw_free(path);
     closedir(d);
 }
 
@@ -360,6 +386,12 @@ static void __add_block_devs(cJSON *arr)
 {
     DIR *d = opendir("/sys/block");
     if (!d) {
+        return;
+    }
+
+    char *path = (char *)claw_malloc(256);
+    if (!path) {
+        closedir(d);
         return;
     }
 
@@ -378,22 +410,21 @@ static void __add_block_devs(cJSON *arr)
 
         cJSON_AddStringToObject(obj, "name", dev);
 
-        char path[256];
-        snprintf(path, sizeof(path), "/sys/block/%s/size", dev);
+        snprintf(path, 256, "/sys/block/%s/size", dev);
         char *size_s = __read_small_file_trim(path);
         if (size_s) {
             cJSON_AddStringToObject(obj, "size_sectors", size_s);
             tal_free(size_s);
         }
 
-        snprintf(path, sizeof(path), "/sys/block/%s/device/model", dev);
+        snprintf(path, 256, "/sys/block/%s/device/model", dev);
         char *model = __read_small_file_trim(path);
         if (model) {
             cJSON_AddStringToObject(obj, "model", model);
             tal_free(model);
         }
 
-        snprintf(path, sizeof(path), "/sys/block/%s/removable", dev);
+        snprintf(path, 256, "/sys/block/%s/removable", dev);
         char *rem = __read_small_file_trim(path);
         if (rem) {
             cJSON_AddStringToObject(obj, "removable", rem);
@@ -403,6 +434,7 @@ static void __add_block_devs(cJSON *arr)
         cJSON_AddItemToArray(arr, obj);
     }
 
+    claw_free(path);
     closedir(d);
 }
 
@@ -413,29 +445,36 @@ static void __add_usb_devs(cJSON *arr)
         return;
     }
 
+    char *base = (char *)claw_malloc(256);
+    char *path = (char *)claw_malloc(300);
+    if (!base || !path) {
+        claw_free(base);
+        claw_free(path);
+        closedir(d);
+        return;
+    }
+
     struct dirent *ent;
     while ((ent = readdir(d)) != NULL) {
         if (ent->d_name[0] == '.') {
             continue;
         }
 
-        char base[256];
-        snprintf(base, sizeof(base), "/sys/bus/usb/devices/%s", ent->d_name);
+        snprintf(base, 256, "/sys/bus/usb/devices/%s", ent->d_name);
 
-        char path[300];
-        snprintf(path, sizeof(path), "%s/idVendor", base);
+        snprintf(path, 300, "%s/idVendor", base);
         char *vendor = __read_small_file_trim(path);
         if (!vendor) {
             continue; /* not a device node */
         }
 
-        snprintf(path, sizeof(path), "%s/idProduct", base);
+        snprintf(path, 300, "%s/idProduct", base);
         char *product_id = __read_small_file_trim(path);
 
-        snprintf(path, sizeof(path), "%s/product", base);
+        snprintf(path, 300, "%s/product", base);
         char *product = __read_small_file_trim(path);
 
-        snprintf(path, sizeof(path), "%s/manufacturer", base);
+        snprintf(path, 300, "%s/manufacturer", base);
         char *mfg = __read_small_file_trim(path);
 
         cJSON *obj = cJSON_CreateObject();
@@ -479,6 +518,8 @@ static void __add_usb_devs(cJSON *arr)
         }
     }
 
+    claw_free(base);
+    claw_free(path);
     closedir(d);
 }
 #endif

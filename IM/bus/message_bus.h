@@ -3,12 +3,6 @@
 
 #include "im_platform.h"
 
-#define IM_CHAN_TELEGRAM  "telegram"
-#define IM_CHAN_DISCORD   "discord"
-#define IM_CHAN_FEISHU    "feishu"
-#define IM_CHAN_WS        "ws"
-#define IM_CHAN_ACP       "acp"
-
 /**
  * @brief Inbound/outbound message on the IM bus.
  */

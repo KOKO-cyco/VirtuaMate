@@ -14,11 +14,6 @@
  *        (tool result already recorded in history by __on_tool_executed)
  *     5. If no tool called → final response, forward to IM, break
  *
- * The semaphore (s_turn.sem) is posted by agent_loop_notify_turn_done(),
- * which is called from ducky_claw_chat.c on AI_USER_EVT_TEXT_STREAM_STOP.
- * The tool hook (__on_tool_executed) sets s_turn.tool_called = true and
- * records the result string in s_turn.tool_result[] for the next iteration.
- *
  * @version 0.4
  * @copyright Copyright (c) 2021-2026 Tuya Inc. All Rights Reserved.
  */
@@ -34,7 +29,7 @@
 #include <stdint.h>
 #include <string.h>
 
-#include "im_api.h"
+#include "sys_bus.h"
 #include "app_im.h"
 #include "ai_agent.h"
 #include "ai_chat_main.h"
@@ -94,7 +89,8 @@ static const char *__json_get_string(const cJSON *item)
 typedef struct {
     SEM_HANDLE   sem;           /* Posted when cloud AI finishes one round  */
     MUTEX_HANDLE lock;          /* Guards tool_called / tool_result         */
-    bool         tool_called;   /* Set by __on_tool_executed                */
+    bool         tool_called;   /* True if __on_tool_executed fired         */
+    bool         tool_call_ok;  /* True if the tool returned OPRT_OK       */
     char         tool_result[TOOL_RESULT_BUF_SIZE]; /* Last tool summary    */
 } turn_state_t;
 
@@ -112,11 +108,6 @@ static turn_state_t s_turn = {0};
 
 static char        *s_last_response      = NULL;
 static MUTEX_HANDLE s_last_response_lock = NULL;
-
-/* Mention targets from the current inbound turn (Feishu @-mentions).
- * Serialised JSON array, heap-allocated, freed at end of each turn. */
-static char        *s_turn_mentions_json = NULL;
-static MUTEX_HANDLE s_mentions_lock      = NULL;
 
 /* True while the inner loop is active (i.e. we are in a tool-use iteration).
  * ducky_claw_chat.c uses this to suppress mid-stream overflow flushes. */
@@ -218,11 +209,8 @@ static void __on_tool_executed(const char *tool_name, OPERATE_RET rt,
 
     PR_DEBUG("Tool exec hook: %s", buf);
 
-    /* Avatar tools (avatar_set_emotion, avatar_play_animation, etc.) are
-     * fire-and-forget side effects whose results the LLM never needs to
-     * re-process.  Skip history recording and tool_called signalling so
-     * the inner loop does NOT re-iterate for pure UI actions. */
-     if (strncmp(tool_name, "avatar_", 7) == 0) {
+    /* Avatar tools are fire-and-forget; skip tool-loop re-iteration. */
+    if (strncmp(tool_name, "avatar_", 7) == 0) {
         PR_DEBUG("Skipping re-iteration for fire-and-forget tool: %s", tool_name);
         return;
     }
@@ -234,6 +222,7 @@ static void __on_tool_executed(const char *tool_name, OPERATE_RET rt,
     if (s_turn.lock) {
         tal_mutex_lock(s_turn.lock);
         s_turn.tool_called = true;
+        s_turn.tool_call_ok = (rt == OPRT_OK);
         strncpy(s_turn.tool_result, buf, TOOL_RESULT_BUF_SIZE - 1);
         s_turn.tool_result[TOOL_RESULT_BUF_SIZE - 1] = '\0';
         tal_mutex_unlock(s_turn.lock);
@@ -363,8 +352,9 @@ static void __build_and_send(const char *content, bool is_tool, bool summarize)
         header = "\n\n# Maximum Iterations Reached\n"
                  "You have reached the tool-call limit for this turn. "
                  "Do NOT call any more tools. "
-                 "Instead, summarise in Chinese what you have accomplished so far, "
+                 "Instead, summarise what you have accomplished so far, "
                  "what succeeded, what failed, and any next steps the user should take. "
+                 "Reply in the same language the user used. "
                  "Last tool result:\n";
     } else if (is_tool) {
         header = "\n\n# Tool Execution Result\n"
@@ -404,32 +394,16 @@ static void agent_loop_task(void *arg)
     while (1) {
         tal_system_sleep(50);
         // PR_INFO("Device Free heap %d", tal_system_get_free_heap_size());
-        im_msg_t in = {0};
-        if (message_bus_pop_inbound(&in, UINT32_MAX) != OPRT_OK) {
+        sys_msg_t in = {0};
+        if (sys_bus_pop_inbound(&in, UINT32_MAX) != OPRT_OK) {
             continue;
         }
         if (!in.content || !s_total_prompt) {
             claw_free(in.content);
-            claw_free(in.mentions_json);
             continue;
         }
 
         app_im_set_target(in.channel, in.chat_id);
-
-        /* Save mention targets for this turn so the final reply can @-mention them */
-        if (s_mentions_lock) {
-            tal_mutex_lock(s_mentions_lock);
-            claw_free(s_turn_mentions_json);
-            s_turn_mentions_json = NULL;
-            if (in.mentions_json && in.mentions_json[0] != '\0') {
-                size_t mlen = strlen(in.mentions_json) + 1;
-                s_turn_mentions_json = claw_malloc(mlen);
-                if (s_turn_mentions_json) {
-                    memcpy(s_turn_mentions_json, in.mentions_json, mlen);
-                }
-            }
-            tal_mutex_unlock(s_mentions_lock);
-        }
 
         PR_INFO("===== AGENT TURN START channel=%s =====", in.channel);
         PR_DEBUG("user input: %.80s", in.content);
@@ -468,6 +442,7 @@ static void agent_loop_task(void *arg)
             if (s_turn.lock) {
                 tal_mutex_lock(s_turn.lock);
                 s_turn.tool_called = false;
+                s_turn.tool_call_ok = false;
                 s_turn.tool_result[0] = '\0';
                 tal_mutex_unlock(s_turn.lock);
             }
@@ -496,41 +471,25 @@ static void agent_loop_task(void *arg)
 
             /* Check whether a tool was called this round */
             bool called = false;
+            bool call_ok = false;
             char result_copy[TOOL_RESULT_BUF_SIZE];
             if (s_turn.lock) {
                 tal_mutex_lock(s_turn.lock);
                 called = s_turn.tool_called;
+                call_ok = s_turn.tool_call_ok;
                 strncpy(result_copy, s_turn.tool_result, TOOL_RESULT_BUF_SIZE - 1);
                 result_copy[TOOL_RESULT_BUF_SIZE - 1] = '\0';
                 tal_mutex_unlock(s_turn.lock);
             }
 
-            PR_INFO("LLM iteration=%d tool_called=%d is_last=%d", iteration + 1, called, is_last);
+            PR_INFO("LLM iteration=%d tool_called=%d tool_ok=%d is_last=%d",
+                    iteration + 1, called, call_ok, is_last);
 
-            if (!called || is_last) {
-                /* No tool call (or forced summary round) → route final response */
-                // PR_INFO("Routing final response target=%s chat_id=%s (no_tool=%d is_last=%d)",
-                //         app_im_get_channel() ? app_im_get_channel() : "(null)",
-                //         app_im_get_chat_id() ? app_im_get_chat_id() : "(null)",
-                //         !called, is_last);
+            if (!called || is_last || call_ok) {
                 if (s_last_response && s_last_response_lock) {
                     tal_mutex_lock(s_last_response_lock);
                     if (s_last_response[0] != '\0') {
-                        char *mentions_copy = NULL;
-                        if (s_mentions_lock) {
-                            tal_mutex_lock(s_mentions_lock);
-                            if (s_turn_mentions_json) {
-                                size_t mlen = strlen(s_turn_mentions_json) + 1;
-                                mentions_copy = claw_malloc(mlen);
-                                if (mentions_copy) {
-                                    memcpy(mentions_copy, s_turn_mentions_json, mlen);
-                                }
-                            }
-                            tal_mutex_unlock(s_mentions_lock);
-                        }
-                        app_im_bot_send_message_with_mentions(s_last_response, mentions_copy);
-
-                        claw_free(mentions_copy);
+                        app_im_bot_send_message(s_last_response);
                     }
                     tal_mutex_unlock(s_last_response_lock);
                 }
@@ -547,7 +506,6 @@ static void agent_loop_task(void *arg)
         PR_INFO("===== AGENT TURN END iterations=%d =====", iteration + 1);
 
         claw_free(in.content);
-        claw_free(in.mentions_json);
     }
 }
 
@@ -558,22 +516,19 @@ int agent_loop_start_cb(void *data)
 
     #define GREETING_MESSAGE "Wake up, my friend!(This is a greeting message, reply within 10 characters.)"
 
-    im_msg_t in = {0};
-    strncpy(in.channel, "system", sizeof(in.channel) - 1);
+    sys_msg_t in = {0};
+    strncpy(in.channel, SYS_CHAN_SYSTEM, sizeof(in.channel) - 1);
     in.content = claw_malloc(strlen(GREETING_MESSAGE) + 1);
     if (!in.content) {
         return OPRT_MALLOC_FAILED;
     }
     strncpy(in.content, GREETING_MESSAGE, strlen(GREETING_MESSAGE) + 1);
-    message_bus_push_inbound(&in);
+    sys_bus_push_inbound(&in);
 
     return 0;
 }
 
-/**
- * agent_loop_init - Initialise the agent loop and start its thread.
- */
-OPERATE_RET agent_loop_init(void)
+OPERATE_RET agent_loop_init_evt_cb(void *data)
 {
     OPERATE_RET rt = OPRT_OK;
 
@@ -612,7 +567,6 @@ OPERATE_RET agent_loop_init(void)
     }
     memset(s_last_response, 0, LAST_RESPONSE_MAX);
     TUYA_CALL_ERR_RETURN(tal_mutex_create_init(&s_last_response_lock));
-    TUYA_CALL_ERR_RETURN(tal_mutex_create_init(&s_mentions_lock));
 
     ai_mcp_server_set_tool_exec_hook(__on_tool_executed, NULL);
 
@@ -632,4 +586,13 @@ OPERATE_RET agent_loop_init(void)
     // tal_event_subscribe(EVENT_AI_CLIENT_RUN, "agent_loop", agent_loop_start_cb, SUBSCRIBE_TYPE_NORMAL);
 
     return OPRT_OK;
+}
+
+/**
+ * agent_loop_init - Initialise the agent loop and start its thread.
+ */
+OPERATE_RET agent_loop_init(void)
+{
+    PR_DEBUG("Agent loop init");
+    return tal_event_subscribe(EVENT_MQTT_CONNECTED, "agent_loop_init", agent_loop_init_evt_cb, SUBSCRIBE_TYPE_EMERGENCY);
 }
