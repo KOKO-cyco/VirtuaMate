@@ -1,6 +1,7 @@
 # ARM64 VRM dependencies (cross-compile)
 
 Prebuilt libraries for **Ubuntu x86_64 → Raspberry Pi / DshanPi ARM64** cross-builds.
+See also `../linux-x86_64/` for native Ubuntu builds.
 When `CMAKE_C_COMPILER` is `aarch64-none-linux-gnu-gcc`, CMake uses these instead of
 host `pkg-config` (sdl2 / glew / assimp).
 

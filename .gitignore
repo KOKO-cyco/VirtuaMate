@@ -61,6 +61,13 @@ doc/
 !third_party/linux-aarch64/sdl2/lib/libSDL2-2.0.so.0
 !third_party/linux-aarch64/sdl2/lib/libSDL2-2.0.so.0.*
 
+# Bundled x86_64 prebuilt libs (native Ubuntu; override *.a / *.so rules below)
+!third_party/linux-x86_64/assimp/lib/libassimp.a
+!third_party/linux-x86_64/glew/lib/libGLEW.a
+!third_party/linux-x86_64/sdl2/lib/libSDL2.so
+!third_party/linux-x86_64/sdl2/lib/libSDL2-2.0.so.0
+!third_party/linux-x86_64/sdl2/lib/libSDL2-2.0.so.0.*
+
 # Local dev artifacts
 tuyadb
 
