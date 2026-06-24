@@ -77,7 +77,7 @@ jobs:
           . ./export.sh
           mkdir -p .cache && touch .cache/.dont_prompt_update_platform
           cd ${{ github.workspace }}
-          for cfg in config/Ubuntu.config config/RaspberryPi.config config/DshanPi_A1.config; do
+          for cfg in config/RaspberryPi.config config/DshanPi_A1.config; do
             cp "$cfg" app_default.config
             tos.py build || exit 1
           done
