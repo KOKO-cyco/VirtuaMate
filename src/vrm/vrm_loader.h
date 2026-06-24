@@ -23,6 +23,13 @@ typedef enum {
     VRM_MTOON_TRANSPARENT_ZWRITE = 3,
 } vrm_mtoon_blend_mode_t;
 
+/** MToon outline width mode (UniVRM _OutlineWidthMode). */
+typedef enum {
+    VRM_MTOON_OUTLINE_NONE = 0,
+    VRM_MTOON_OUTLINE_WORLD = 1,
+    VRM_MTOON_OUTLINE_SCREEN = 2,
+} vrm_mtoon_outline_width_mode_t;
+
 /** Parsed VRM / glTF material (MToon-focused). */
 typedef struct {
     char                    name[64];
@@ -38,6 +45,24 @@ typedef struct {
     float                   shade_toony;
     int                     tex_main;
     int                     tex_shade;
+    float                   bump_scale;
+    int                     tex_bump;
+    float                   emission_color[4];
+    int                     tex_emission;
+    float                   rim_color[4];
+    float                   rim_fresnel_power;
+    float                   rim_lift;
+    float                   rim_lighting_mix;
+    int                     tex_rim;
+    int                     tex_matcap;
+    float                   outline_color[4];
+    float                   outline_width;
+    int                     outline_width_mode;
+    int                     outline_color_mode;
+    int                     outline_cull_mode;
+    float                   outline_lighting_mix;
+    float                   outline_scaled_max_dist;
+    int                     tex_outline_width;
 } vrm_material_t;
 
 /** Decoded texture (RGBA pixels). */
@@ -332,6 +357,13 @@ int vrm_material_render_queue(const vrm_model_t *model, uint32_t mesh_index);
  * @return 1 if MToon, else 0.
  */
 int vrm_material_is_mtoon(const vrm_model_t *model, uint32_t mesh_index);
+
+/**
+ * @brief Return 1 if mesh material has an active MToon outline pass.
+ * @param[in] mat  Material, or NULL.
+ * @return 1 if outline should be drawn, else 0.
+ */
+int vrm_material_has_outline(const vrm_material_t *mat);
 
 /**
  * @brief Get material for a mesh.
