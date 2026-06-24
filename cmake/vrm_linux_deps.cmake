@@ -48,17 +48,35 @@ if(_VRM_BUNDLED_ROOT)
 
     get_filename_component(_VRM_SDL2_LIB_DIR "${_VRM_SDL2_LIB}" DIRECTORY)
 
-    set(VRM_RENDER_LINK_FLAGS
-        "${_VRM_ASSIMP_LIB}"
-        "${_VRM_GLEW_LIB}"
-        "${_VRM_SDL2_LIB}"
-        "-Wl,-rpath,${_VRM_SDL2_LIB_DIR}"
-        "-Wl,--allow-shlib-undefined"
-        "-Wl,--unresolved-symbols=ignore-all"
-        "-ldl"
-        "-lpthread"
-        "-lm"
-    )
+    if(_VRM_C_COMPILER_NAME MATCHES "^aarch64-none-linux-gnu-gcc$")
+        # Cross-link: GL/X11 resolve on the Pi at runtime.
+        set(VRM_RENDER_LINK_FLAGS
+            "${_VRM_ASSIMP_LIB}"
+            "${_VRM_GLEW_LIB}"
+            "${_VRM_SDL2_LIB}"
+            "-Wl,--allow-shlib-undefined"
+            "-Wl,--unresolved-symbols=ignore-all"
+            "-ldl"
+            "-lpthread"
+            "-lm"
+        )
+    else()
+        # Native x86_64: link system GL/X11 + libm for GLEW (ignore-all breaks tanf@plt).
+        set(VRM_RENDER_LINK_FLAGS
+            "${_VRM_ASSIMP_LIB}"
+            "${_VRM_GLEW_LIB}"
+            "-lGL"
+            "-lX11"
+            "-lXext"
+            "${_VRM_SDL2_LIB}"
+            "-Wl,-rpath,${_VRM_SDL2_LIB_DIR}"
+            "-Wl,--allow-shlib-undefined"
+            "-lz"
+            "-ldl"
+            "-lpthread"
+            "-lm"
+        )
+    endif()
     string(REPLACE ";" " " VRM_RENDER_LINK_FLAGS "${VRM_RENDER_LINK_FLAGS}")
 
     message(STATUS "[VRM] Using bundled deps from ${_VRM_BUNDLED_ROOT}")

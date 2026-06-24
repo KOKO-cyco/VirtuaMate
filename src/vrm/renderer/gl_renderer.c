@@ -172,13 +172,18 @@ int vrm_viewer_run(const char *model_path, const char *vrma_dir)
     }
 
     SDL_GL_SetSwapInterval(1);
+    SDL_GL_MakeCurrent(window, gl_ctx);
 
     glewExperimental = GL_TRUE;
-    if (glewInit() != GLEW_OK) {
-        fprintf(stderr, "[vrm_viewer] glewInit failed\n");
+    GLenum glew_err = glewInit();
+    if (glew_err != GLEW_OK) {
+        fprintf(stderr, "[vrm_viewer] glewInit failed: %s\n",
+                glewGetErrorString(glew_err));
         SDL_GL_DeleteContext(gl_ctx); SDL_DestroyWindow(window);
         SDL_Quit(); vrm_model_free(&model); return -1;
     }
+    /* Core profile may leave a benign GL_INVALID_ENUM after glewInit(). */
+    glGetError();
 
     printf("[vrm_viewer] GL version : %s\n", glGetString(GL_VERSION));
     printf("[vrm_viewer] GL renderer: %s\n", glGetString(GL_RENDERER));
