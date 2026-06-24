@@ -54,7 +54,15 @@ tuya_app_config_secrets.h
 *.build
 app_default.config
 doc/
-monitor.log
+# Bundled ARM64 prebuilt libs (cross-compile; override *.a / *.so rules below)
+!third_party/linux-aarch64/assimp/lib/libassimp.a
+!third_party/linux-aarch64/glew/lib/libGLEW.a
+!third_party/linux-aarch64/sdl2/lib/libSDL2.so
+!third_party/linux-aarch64/sdl2/lib/libSDL2-2.0.so.0
+!third_party/linux-aarch64/sdl2/lib/libSDL2-2.0.so.0.*
+
+# Local dev artifacts
+tuyadb
 
 # Kernel Module Compile Results
 *.mod*

@@ -21,6 +21,7 @@
 #include <assimp/scene.h>
 #include <assimp/postprocess.h>
 #include <assimp/material.h>
+#include <stb/stb_image.h>
 
 int vrm_model_load(vrm_model_t *model, const char *path)
 {

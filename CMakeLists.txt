@@ -49,9 +49,12 @@ set(APP_INC
     ${APP_PATH}/skills
     ${APP_PATH}/agent
     ${APP_PATH}/ai_components/assets/include
+    ${APP_PATH}/third_party/stb
     ${APP_PATH}/src/vrm
     ${APP_PATH}/TuyaOpen/src/liblvgl/v9/lvgl/src/libs/tiny_ttf
 )
+
+include(${APP_PATH}/cmake/vrm_linux_deps.cmake)
 
 ########################################
 # Target Configure
@@ -68,12 +71,9 @@ target_include_directories(${EXAMPLE_LIB}
         ${APP_INC}
     )
 
+if(VRM_RENDER_COMPILE_FLAGS)
+    target_compile_options(${EXAMPLE_LIB} PRIVATE ${VRM_RENDER_COMPILE_FLAGS})
+endif()
+
 add_subdirectory(${APP_PATH}/ai_components ${CMAKE_BINARY_DIR}/ai_components)
 add_subdirectory(${APP_PATH}/IM ${CMAKE_BINARY_DIR}/IM)
-
-if(PLATFORM_NAME STREQUAL "LINUX")
-    find_package(PkgConfig REQUIRED)
-    pkg_check_modules(VRM_RENDER_DEPS REQUIRED sdl2 glew assimp)
-    string(REPLACE ";" " " VRM_RENDER_LINK_FLAGS "${VRM_RENDER_DEPS_LDFLAGS}")
-    set(PLATFORM_NEED_LIBS "${PLATFORM_NEED_LIBS} ${VRM_RENDER_LINK_FLAGS}")
-endif()
