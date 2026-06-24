@@ -172,6 +172,31 @@ static void __material_defaults(vrm_material_t *m)
     m->blend_mode = VRM_MTOON_OPAQUE;
     m->tex_main = -1;
     m->tex_shade = -1;
+    m->tex_bump = -1;
+    m->tex_emission = -1;
+    m->tex_rim = -1;
+    m->tex_matcap = -1;
+    m->bump_scale = 1.0f;
+    m->emission_color[0] = 0.0f;
+    m->emission_color[1] = 0.0f;
+    m->emission_color[2] = 0.0f;
+    m->emission_color[3] = 1.0f;
+    m->rim_color[0] = 0.0f;
+    m->rim_color[1] = 0.0f;
+    m->rim_color[2] = 0.0f;
+    m->rim_color[3] = 1.0f;
+    m->rim_fresnel_power = 1.0f;
+    m->rim_lift = 0.0f;
+    m->rim_lighting_mix = 0.0f;
+    m->tex_outline_width = -1;
+    m->outline_color[0] = 0.0f;
+    m->outline_color[1] = 0.0f;
+    m->outline_color[2] = 0.0f;
+    m->outline_color[3] = 1.0f;
+    m->outline_width = 0.0f;
+    m->outline_width_mode = VRM_MTOON_OUTLINE_NONE;
+    m->outline_scaled_max_dist = 1.0f;
+    m->outline_lighting_mix = 1.0f;
     snprintf(m->shader, sizeof(m->shader), "none");
 }
 
@@ -362,6 +387,12 @@ static void __parse_material_property(vrm_material_t *mat,
     int          blend_f;
     int          main_gltf;
     int          shade_gltf;
+    int          bump_gltf;
+    int          emission_gltf;
+    int          rim_gltf;
+    int          matcap_gltf;
+    int          outline_w_gltf;
+    int          width_mode;
 
     __material_defaults(mat);
 
@@ -392,24 +423,52 @@ static void __parse_material_property(vrm_material_t *mat,
         mat->cutoff = __json_float(fp, "_Cutoff", mat->cutoff);
         mat->shade_shift = __json_float(fp, "_ShadeShift", mat->shade_shift);
         mat->shade_toony = __json_float(fp, "_ShadeToony", mat->shade_toony);
+        mat->bump_scale = __json_float(fp, "_BumpScale", mat->bump_scale);
+        mat->rim_fresnel_power = __json_float(fp, "_RimFresnelPower", mat->rim_fresnel_power);
+        mat->rim_lift = __json_float(fp, "_RimLift", mat->rim_lift);
+        mat->rim_lighting_mix = __json_float(fp, "_RimLightingMix", mat->rim_lighting_mix);
+        mat->outline_width = __json_float(fp, "_OutlineWidth", mat->outline_width);
+        width_mode = (int)__json_float(fp, "_OutlineWidthMode", 0.0f);
+        if (width_mode >= 0 && width_mode <= 2) {
+            mat->outline_width_mode = width_mode;
+        }
+        mat->outline_color_mode = (int)__json_float(fp, "_OutlineColorMode", 0.0f);
+        mat->outline_cull_mode = (int)__json_float(fp, "_OutlineCullMode", 0.0f);
+        mat->outline_lighting_mix = __json_float(fp, "_OutlineLightingMix",
+                                                 mat->outline_lighting_mix);
+        mat->outline_scaled_max_dist = __json_float(fp, "_OutlineScaledMaxDistance",
+                                                    mat->outline_scaled_max_dist);
     }
 
     vp = cJSON_GetObjectItem(prop, "vectorProperties");
     if (vp != NULL) {
         __json_vec4(mat->color, cJSON_GetObjectItem(vp, "_Color"));
         __json_vec4(mat->shade_color, cJSON_GetObjectItem(vp, "_ShadeColor"));
+        __json_vec4(mat->emission_color, cJSON_GetObjectItem(vp, "_EmissionColor"));
+        __json_vec4(mat->rim_color, cJSON_GetObjectItem(vp, "_RimColor"));
+        __json_vec4(mat->outline_color, cJSON_GetObjectItem(vp, "_OutlineColor"));
     }
 
     tp = cJSON_GetObjectItem(prop, "textureProperties");
     if (tp != NULL) {
         main_gltf = __tex_prop_index(tp, "_MainTex");
         shade_gltf = __tex_prop_index(tp, "_ShadeTexture");
+        bump_gltf = __tex_prop_index(tp, "_BumpMap");
+        emission_gltf = __tex_prop_index(tp, "_EmissionMap");
+        rim_gltf = __tex_prop_index(tp, "_RimTexture");
+        matcap_gltf = __tex_prop_index(tp, "_SphereAdd");
+        outline_w_gltf = __tex_prop_index(tp, "_OutlineWidthTexture");
         mat->tex_main = __resolve_gltf_texture(model, root, main_gltf);
         mat->tex_shade = __resolve_gltf_texture(model, root, shade_gltf);
         if (mat->tex_shade < 0) {
             mat->tex_shade = mat->tex_main;
         }
         __sanitize_mtoon_shade(root, model, shade_gltf, mat);
+        mat->tex_bump = __resolve_gltf_texture(model, root, bump_gltf);
+        mat->tex_emission = __resolve_gltf_texture(model, root, emission_gltf);
+        mat->tex_rim = __resolve_gltf_texture(model, root, rim_gltf);
+        mat->tex_matcap = __resolve_gltf_texture(model, root, matcap_gltf);
+        mat->tex_outline_width = __resolve_gltf_texture(model, root, outline_w_gltf);
     }
 }
 
@@ -559,6 +618,25 @@ int vrm_material_is_mtoon(const vrm_model_t *model, uint32_t mesh_index)
         return 0;
     }
     return model->materials[mi].is_mtoon;
+}
+
+/**
+ * @brief Return 1 if material has an active MToon outline pass.
+ * @param[in] mat  Material, or NULL.
+ * @return 1 if outline should be drawn, else 0.
+ */
+int vrm_material_has_outline(const vrm_material_t *mat)
+{
+    if (mat == NULL || !mat->is_mtoon) {
+        return 0;
+    }
+    if (mat->outline_width_mode == VRM_MTOON_OUTLINE_NONE) {
+        return 0;
+    }
+    if (mat->outline_width <= 0.00001f) {
+        return 0;
+    }
+    return 1;
 }
 
 /**

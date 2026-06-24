@@ -7,6 +7,8 @@
  */
 #include "mtoon_draw.h"
 
+#include "mtoon_outline.h"
+
 #include <stdlib.h>
 #include <string.h>
 
@@ -161,49 +163,163 @@ static void __draw_mtoon_mesh(GLuint prog, const gpu_mesh_t *g,
                               GLuint bone_tbo_tex, GLuint white_tex)
 {
     float shade_color[4];
+    float zero[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
 
     glUseProgram(prog);
     glUniform4fv(glGetUniformLocation(prog, "u_color"), 1, g->color);
     if (mat != NULL) {
         glUniform4fv(glGetUniformLocation(prog, "u_shade_color"), 1, mat->shade_color);
+        glUniform4fv(glGetUniformLocation(prog, "u_emission_color"), 1, mat->emission_color);
+        glUniform4fv(glGetUniformLocation(prog, "u_rim_color"), 1, mat->rim_color);
         glUniform1f(glGetUniformLocation(prog, "u_shade_shift"), mat->shade_shift);
         glUniform1f(glGetUniformLocation(prog, "u_shade_toony"), mat->shade_toony);
+        glUniform1f(glGetUniformLocation(prog, "u_bump_scale"), mat->bump_scale);
+        glUniform1f(glGetUniformLocation(prog, "u_rim_fresnel_power"), mat->rim_fresnel_power);
+        glUniform1f(glGetUniformLocation(prog, "u_rim_lift"), mat->rim_lift);
+        glUniform1f(glGetUniformLocation(prog, "u_rim_lighting_mix"), mat->rim_lighting_mix);
         glUniform1f(glGetUniformLocation(prog, "u_cutoff"), mat->cutoff);
         glUniform1i(glGetUniformLocation(prog, "u_blend_mode"), (int)mat->blend_mode);
+        glUniform1i(glGetUniformLocation(prog, "u_is_unlit"), mat->is_unlit);
     } else {
         shade_color[0] = 0.9f;
         shade_color[1] = 0.8f;
         shade_color[2] = 0.7f;
         shade_color[3] = 1.0f;
         glUniform4fv(glGetUniformLocation(prog, "u_shade_color"), 1, shade_color);
+        glUniform4fv(glGetUniformLocation(prog, "u_emission_color"), 1, zero);
+        glUniform4fv(glGetUniformLocation(prog, "u_rim_color"), 1, zero);
         glUniform1f(glGetUniformLocation(prog, "u_shade_shift"), 0.0f);
         glUniform1f(glGetUniformLocation(prog, "u_shade_toony"), 0.9f);
+        glUniform1f(glGetUniformLocation(prog, "u_bump_scale"), 1.0f);
+        glUniform1f(glGetUniformLocation(prog, "u_rim_fresnel_power"), 1.0f);
+        glUniform1f(glGetUniformLocation(prog, "u_rim_lift"), 0.0f);
+        glUniform1f(glGetUniformLocation(prog, "u_rim_lighting_mix"), 0.0f);
         glUniform1f(glGetUniformLocation(prog, "u_cutoff"), 0.5f);
         glUniform1i(glGetUniformLocation(prog, "u_blend_mode"), 0);
+        glUniform1i(glGetUniformLocation(prog, "u_is_unlit"), 0);
     }
 
     glUniform1i(glGetUniformLocation(prog, "u_has_main"), g->has_texture);
     glUniform1i(glGetUniformLocation(prog, "u_has_shade"), g->has_shade_tex);
+    glUniform1i(glGetUniformLocation(prog, "u_has_bump"), g->has_bump_tex);
+    glUniform1i(glGetUniformLocation(prog, "u_has_emission"), g->has_emission_tex);
+    glUniform1i(glGetUniformLocation(prog, "u_has_rim"), g->has_rim_tex);
+    glUniform1i(glGetUniformLocation(prog, "u_has_matcap"), g->has_matcap_tex);
     glUniform1i(glGetUniformLocation(prog, "u_skinned"), g->has_bones);
 
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, g->has_texture ? g->tex_id : white_tex);
     glActiveTexture(GL_TEXTURE2);
     glBindTexture(GL_TEXTURE_2D, g->has_shade_tex ? g->tex_shade : white_tex);
+    glActiveTexture(GL_TEXTURE3);
+    glBindTexture(GL_TEXTURE_2D, g->has_bump_tex ? g->tex_bump : white_tex);
+    glActiveTexture(GL_TEXTURE4);
+    glBindTexture(GL_TEXTURE_2D, g->has_emission_tex ? g->tex_emission : white_tex);
+    glActiveTexture(GL_TEXTURE5);
+    glBindTexture(GL_TEXTURE_2D, g->has_rim_tex ? g->tex_rim : white_tex);
+    glActiveTexture(GL_TEXTURE6);
+    glBindTexture(GL_TEXTURE_2D, g->has_matcap_tex ? g->tex_matcap : white_tex);
     glUniform1i(glGetUniformLocation(prog, "u_main_tex"), 0);
     glUniform1i(glGetUniformLocation(prog, "u_shade_tex"), 2);
+    glUniform1i(glGetUniformLocation(prog, "u_bump_tex"), 3);
+    glUniform1i(glGetUniformLocation(prog, "u_emission_tex"), 4);
+    glUniform1i(glGetUniformLocation(prog, "u_rim_tex"), 5);
+    glUniform1i(glGetUniformLocation(prog, "u_matcap_tex"), 6);
 
     glBindVertexArray(g->vao);
     glDrawElements(GL_TRIANGLES, (GLsizei)g->index_count, GL_UNSIGNED_INT, 0);
+}
+
+/**
+ * @brief Return 1 if outline pass should run for this blend mode (M3).
+ * @param[in] blend_mode  vrm_mtoon_blend_mode_t value.
+ * @return 1 to draw outline, 0 to skip.
+ */
+static int __outline_for_blend_mode(int blend_mode)
+{
+    switch (blend_mode) {
+    case VRM_MTOON_OPAQUE:
+    case VRM_MTOON_CUTOUT:
+    case VRM_MTOON_TRANSPARENT_ZWRITE:
+        return 1;
+    case VRM_MTOON_TRANSPARENT:
+    default:
+        return 0;
+    }
+}
+
+/**
+ * @brief Draw outline passes for all sorted meshes (inverted-hull).
+ * @return none
+ */
+static void __draw_outlines(const vrm_model_t *model,
+                            const gpu_mesh_t *gpu,
+                            const draw_item_t *items,
+                            uint32_t item_count,
+                            GLuint outline_prog,
+                            const float mvp[16],
+                            const float model_mat[16],
+                            GLuint bone_tbo_tex,
+                            GLuint white_tex)
+{
+    uint32_t i;
+    GLboolean cull_enabled;
+    GLboolean offset_enabled;
+
+    if (outline_prog == 0 || items == NULL) {
+        return;
+    }
+
+    cull_enabled = glIsEnabled(GL_CULL_FACE);
+    offset_enabled = glIsEnabled(GL_POLYGON_OFFSET_FILL);
+
+    glEnable(GL_CULL_FACE);
+    /* VRM MToon inverted hull: cull front faces, draw expanded back faces. */
+    glCullFace(GL_FRONT);
+    glEnable(GL_POLYGON_OFFSET_FILL);
+    glPolygonOffset(1.0f, 1.0f);
+    glDisable(GL_BLEND);
+    glDepthMask(GL_TRUE);
+    glDepthFunc(GL_LESS);
+
+    if (bone_tbo_tex) {
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_BUFFER, bone_tbo_tex);
+    }
+
+    for (i = 0; i < item_count; i++) {
+        uint32_t              mi = items[i].mesh_index;
+        const gpu_mesh_t     *g = &gpu[mi];
+        const vrm_material_t *mat = vrm_mesh_material(model, mi);
+
+        if (!g->use_mtoon || mat == NULL || !vrm_material_has_outline(mat)) {
+            continue;
+        }
+        if (!__outline_for_blend_mode(items[i].blend_mode)) {
+            continue;
+        }
+
+        mtoon_outline_draw_mesh(outline_prog, g, mat, model, mvp, model_mat,
+                                bone_tbo_tex, white_tex);
+    }
+
+    if (!offset_enabled) {
+        glDisable(GL_POLYGON_OFFSET_FILL);
+    }
+    if (!cull_enabled) {
+        glDisable(GL_CULL_FACE);
+    }
 }
 
 void mtoon_draw_model(const vrm_model_t *model,
                       const gpu_mesh_t *gpu,
                       GLuint mtoon_prog,
                       GLuint legacy_prog,
+                      GLuint outline_prog,
                       const float mvp[16],
                       const float model_mat[16],
                       const float light_dir[3],
+                      const float camera_pos[3],
                       GLuint bone_tbo_tex,
                       GLuint white_tex)
 {
@@ -237,6 +353,9 @@ void mtoon_draw_model(const vrm_model_t *model,
         glBindTexture(GL_TEXTURE_BUFFER, bone_tbo_tex);
     }
 
+    __draw_outlines(model, gpu, items, model->mesh_count, outline_prog,
+                    mvp, model_mat, bone_tbo_tex, white_tex);
+
     for (i = 0; i < model->mesh_count; i++) {
         uint32_t              mi = items[i].mesh_index;
         const gpu_mesh_t     *g = &gpu[mi];
@@ -257,6 +376,7 @@ void mtoon_draw_model(const vrm_model_t *model,
                 glUniformMatrix4fv(glGetUniformLocation(prog, "u_model"),
                                      1, GL_FALSE, model_mat);
                 glUniform3fv(glGetUniformLocation(prog, "u_light_dir"), 1, light_dir);
+                glUniform3fv(glGetUniformLocation(prog, "u_camera_pos"), 1, camera_pos);
                 glUniform1i(glGetUniformLocation(prog, "u_bone_tbo"), 1);
                 active_prog = prog;
             }

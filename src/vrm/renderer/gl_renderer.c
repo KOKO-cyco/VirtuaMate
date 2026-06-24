@@ -15,6 +15,7 @@
 #include "vrm_skybox.h"
 #include "vrm_overlay.h"
 #include "mtoon_shaders.h"
+#include "mtoon_outline.h"
 #include "mtoon_draw.h"
 
 #include <stdio.h>
@@ -185,6 +186,7 @@ int vrm_viewer_run(const char *model_path, const char *vrma_dir)
     /* ---- compile shaders ---- */
     GLuint model_prog = __link_program(s_model_vs, s_model_fs);
     GLuint mtoon_prog = mtoon_create_program();
+    GLuint outline_prog = mtoon_outline_create_program();
     GLuint grid_prog  = __link_program(s_grid_vs, s_grid_fs);
     GLuint bg_prog    = __link_program(s_bg_vs, s_bg_fs);
     GLuint shadow_prog = __link_program(s_shadow_vs, s_shadow_fs);
@@ -1181,8 +1183,8 @@ int vrm_viewer_run(const char *model_path, const char *vrma_dir)
             float ld[3] = { 0.0f, 0.15f, 1.0f };
             float len = sqrtf(ld[0]*ld[0] + ld[1]*ld[1] + ld[2]*ld[2]);
             ld[0] /= len; ld[1] /= len; ld[2] /= len;
-            mtoon_draw_model(&model, gpu, mtoon_prog, model_prog,
-                             mvp, model_mat, ld, bone_tbo_tex, white_tex);
+            mtoon_draw_model(&model, gpu, mtoon_prog, model_prog, outline_prog,
+                             mvp, model_mat, ld, eye, bone_tbo_tex, white_tex);
         }
 
         /* ---- Ground shadow ---- */
@@ -1263,6 +1265,9 @@ int vrm_viewer_run(const char *model_path, const char *vrma_dir)
     glDeleteProgram(model_prog);
     if (mtoon_prog) {
         glDeleteProgram(mtoon_prog);
+    }
+    if (outline_prog) {
+        glDeleteProgram(outline_prog);
     }
     glDeleteProgram(grid_prog);
     glDeleteProgram(bg_prog);

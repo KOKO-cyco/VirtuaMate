@@ -26,9 +26,11 @@ extern "C" {
  * @param[in] gpu           GPU mesh array (mesh_count entries).
  * @param[in] mtoon_prog    MToon shader program.
  * @param[in] legacy_prog   Legacy toon shader program.
+ * @param[in] outline_prog  MToon outline program (0 to skip).
  * @param[in] mvp           Model-view-projection matrix.
  * @param[in] model_mat     Model matrix.
  * @param[in] light_dir     Normalized light direction (3 floats).
+ * @param[in] camera_pos    World-space camera position (3 floats).
  * @param[in] bone_tbo_tex  Bone matrix texture buffer object (0 if none).
  * @param[in] white_tex     1x1 white fallback texture.
  * @return none
@@ -37,9 +39,11 @@ void mtoon_draw_model(const vrm_model_t *model,
                       const gpu_mesh_t *gpu,
                       GLuint mtoon_prog,
                       GLuint legacy_prog,
+                      GLuint outline_prog,
                       const float mvp[16],
                       const float model_mat[16],
                       const float light_dir[3],
+                      const float camera_pos[3],
                       GLuint bone_tbo_tex,
                       GLuint white_tex);
 
